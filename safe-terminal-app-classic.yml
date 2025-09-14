@@ -1,0 +1,130 @@
+name: yunderaterminal
+
+services:
+  yunderaterminal:
+    image: nginx:alpine
+    container_name: yunderaterminal
+    restart: unless-stopped
+    expose:
+      - "3000"
+    user: "root"
+    command: ["nginx", "-c", "/custom-config/nginx.conf", "-g", "daemon off;"]
+    volumes:
+      - type: bind
+        source: /DATA/AppData/yunderaterminal/nginx
+        target: /custom-config
+        read_only: true
+      - type: bind
+        source: /DATA/AppData/yunderaterminal
+        target: /DATA/AppData/yunderaterminal
+    depends_on:
+      - ttyd
+    networks:
+      - pcs
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+
+  ttyd:
+    image: tsl0922/ttyd:latest
+    container_name: yunderaterminaltty
+    restart: unless-stopped
+    user: "root"
+    command: ["ttyd", "--writable", "--client-option", "enableZmodem=true", "--client-option", "enableSixel=false", "--client-option", "enableTrzsz=false", "--terminal-type", "xterm-256color", "chroot", "/host", "bash"]
+    volumes:
+      - type: bind
+        source: /
+        target: /host
+    networks:
+      - pcs
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+
+networks:
+  pcs:
+    external: true
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: yunderaterminal
+  author: yundera
+  developer: yundera
+  icon: https://cdn-icons-png.flaticon.com/512/2933/2933245.png
+  tagline:
+    en_us: "Secure hash-locked terminal access (Classic)"
+  category: Utilities
+  description:
+    en_us: "A secure terminal with hash-based authentication using classic nginx approach"
+  title:
+    en_us: "Yundera Terminal Classic"
+  store_app_id: yunderaterminal-classic
+  is_uncontrolled: false
+  index: /?hash=$AUTH_HASH
+  webui_port: 3000
+  volumes:
+    - /DATA/AppData/$AppID/nginx
+  pre-install-cmd: |
+    mkdir -p /DATA/AppData/yunderaterminal/nginx 2>/dev/null
+    mkdir -p /DATA/AppData/yunderaterminal/nginx-cache/{client_temp,proxy_temp,fastcgi_temp,uwsgi_temp,scgi_temp} 2>/dev/null
+    chown -R ubuntu:988 /DATA/AppData/yunderaterminal/ 2>/dev/null || true
+    chmod -R 755 /DATA/AppData/yunderaterminal/ 2>/dev/null || true
+
+    NGINX_DIR="/DATA/AppData/yunderaterminal/nginx"
+    cat > "$NGINX_DIR/nginx.conf" << 'NGINX_EOF'
+    pid /DATA/AppData/yunderaterminal/nginx-cache/nginx.pid;
+    error_log /DATA/AppData/yunderaterminal/nginx-cache/error.log;
+
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+
+        client_body_temp_path /DATA/AppData/yunderaterminal/nginx-cache/client_temp;
+        proxy_temp_path /DATA/AppData/yunderaterminal/nginx-cache/proxy_temp;
+        fastcgi_temp_path /DATA/AppData/yunderaterminal/nginx-cache/fastcgi_temp;
+        uwsgi_temp_path /DATA/AppData/yunderaterminal/nginx-cache/uwsgi_temp;
+        scgi_temp_path /DATA/AppData/yunderaterminal/nginx-cache/scgi_temp;
+
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
+        keepalive_timeout 65;
+
+        server {
+            listen 3000;
+            server_name _;
+
+            location / {
+                if (\$arg_hash != "$AUTH_HASH") {
+                    return 403 "Access denied: Invalid or missing authentication hash. Please access through CasaOS dashboard.";
+                }
+
+                proxy_pass http://yunderaterminaltty:7681;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade \$http_upgrade;
+                proxy_set_header Connection "upgrade";
+                proxy_set_header Host \$host;
+                proxy_set_header X-Real-IP \$remote_addr;
+                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto \$scheme;
+
+                proxy_buffering off;
+                proxy_cache off;
+                proxy_read_timeout 86400;
+                proxy_send_timeout 86400;
+                proxy_connect_timeout 60s;
+
+                proxy_set_header X-Forwarded-Host \$host;
+                proxy_set_header X-Forwarded-Server \$host;
+            }
+        }
+    }
+    NGINX_EOF
