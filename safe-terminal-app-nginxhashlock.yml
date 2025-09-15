@@ -13,6 +13,12 @@ services:
       BACKEND_HOST: "ttyd"
       BACKEND_PORT: "7681"
       LISTEN_PORT: "3000"
+      # ALLOWED_EXTENSIONS: "js,css,png,ico,svg"
+      # ↑ Uncomment to allow static assets without auth
+      # ↑ Not needed for terminal - ttyd serves self-contained HTML
+      # ALLOWED_PATHS: "login,about,api/health,api/public"
+      # ↑ Uncomment to allow public pages/APIs without auth
+      # ↑ Example: /login + /api/public accessible, /admin still requires hash
     depends_on:
       - ttyd
     networks:
