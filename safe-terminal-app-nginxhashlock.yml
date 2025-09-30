@@ -69,6 +69,3 @@ x-casaos:
   # nginxhashlock handles the hash validation automatically
   index: /?hash=$AUTH_HASH
   webui_port: 3000
-  pre-install-cmd: |
-    mkdir -p /DATA/AppData/yunderaterminal 2>/dev/null || true
-    chmod -R 755 /DATA/AppData/yunderaterminal/ 2>/dev/null || true
