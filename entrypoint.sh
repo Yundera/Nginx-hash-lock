@@ -49,3 +49,4 @@ cat /etc/nginx/nginx.conf
 # Start nginx
 echo "Starting nginx..."
 exec nginx -g "daemon off;"
+
