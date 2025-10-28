@@ -1,26 +1,28 @@
-name: yunderaterminal
+name: yunderaterminalboth
 
 services:
-  yunderaterminal:
+  yunderaterminalboth:
     image: krizcold/nginxhashlock:latest
-    container_name: yunderaterminal
+    container_name: yunderaterminalboth
     restart: unless-stopped
     expose:
       - "3000"
     user: "root"
     environment:
+      # Both authentication methods enabled - accept either!
       AUTH_HASH: $AUTH_HASH
-      BACKEND_HOST: "ttyd"
+      USER: $USER
+      PASSWORD: $PASSWORD
+      SESSION_DURATION_HOURS: "168"  # 1 week
+      BACKEND_HOST: "ttydboth"
       BACKEND_PORT: "7681"
       LISTEN_PORT: "3000"
       # ALLOWED_EXTENSIONS: "js,css,png,ico,svg"
       # ↑ Uncomment to allow static assets without auth
-      # ↑ Not needed for terminal - ttyd serves self-contained HTML
-      # ALLOWED_PATHS: "login,about,api/health,api/public"
+      # ALLOWED_PATHS: "api/health"
       # ↑ Uncomment to allow public pages/APIs without auth
-      # ↑ Example: /login + /api/public accessible, /admin still requires hash
     depends_on:
-      - ttyd
+      - ttydboth
     networks:
       - pcs
     privileged: true
@@ -28,9 +30,9 @@ services:
       - SYS_ADMIN
       - NET_ADMIN
 
-  ttyd:
+  ttydboth:
     image: tsl0922/ttyd:latest
-    container_name: yunderaterminaltty
+    container_name: yunderaterminalbothttyd
     restart: unless-stopped
     user: "root"
     command: ["ttyd", "--writable", "--client-option", "enableZmodem=true", "--client-option", "enableSixel=false", "--client-option", "enableTrzsz=false", "--terminal-type", "xterm-256color", "chroot", "/host", "bash"]
@@ -53,18 +55,19 @@ x-casaos:
   architectures:
     - amd64
     - arm64
-  main: yunderaterminal
+  main: yunderaterminalboth
   author: yundera
   developer: yundera
   icon: https://cdn-icons-png.flaticon.com/512/2933/2933245.png
   tagline:
-    en_us: "Secure hash-locked terminal access"
+    en_us: "Secure dual-auth terminal - hash OR password"
   category: Utilities
   description:
-    en_us: "A secure terminal with hash-based authentication using nginxhashlock"
+    en_us: "A secure terminal supporting BOTH hash-based and username/password authentication. Access via URL hash for quick access, or login page for session-based access. Maximum flexibility!"
   title:
-    en_us: "Yundera Terminal"
-  store_app_id: yunderaterminal
+    en_us: "Yundera Terminal (Dual Auth)"
+  store_app_id: yunderaterminalboth
   is_uncontrolled: false
+  # Can use hash directly or go to login page
   index: /?hash=$AUTH_HASH
   webui_port: 3000

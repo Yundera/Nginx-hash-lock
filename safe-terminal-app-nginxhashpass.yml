@@ -1,26 +1,28 @@
-name: yunderaterminal
+name: yunderaterminalpass
 
 services:
-  yunderaterminal:
+  yunderaterminalpass:
     image: krizcold/nginxhashlock:latest
-    container_name: yunderaterminal
+    container_name: yunderaterminalpass
     restart: unless-stopped
     expose:
       - "3000"
     user: "root"
     environment:
-      AUTH_HASH: $AUTH_HASH
-      BACKEND_HOST: "ttyd"
+      USER: $USER
+      PASSWORD: $PASSWORD
+      SESSION_DURATION_HOURS: "720"  # 30 days (default)
+      BACKEND_HOST: "ttydpass"
       BACKEND_PORT: "7681"
       LISTEN_PORT: "3000"
       # ALLOWED_EXTENSIONS: "js,css,png,ico,svg"
       # ↑ Uncomment to allow static assets without auth
       # ↑ Not needed for terminal - ttyd serves self-contained HTML
-      # ALLOWED_PATHS: "login,about,api/health,api/public"
+      # ALLOWED_PATHS: "api/health"
       # ↑ Uncomment to allow public pages/APIs without auth
-      # ↑ Example: /login + /api/public accessible, /admin still requires hash
+      # ↑ Example: /api/health accessible without login
     depends_on:
-      - ttyd
+      - ttydpass
     networks:
       - pcs
     privileged: true
@@ -28,9 +30,9 @@ services:
       - SYS_ADMIN
       - NET_ADMIN
 
-  ttyd:
+  ttydpass:
     image: tsl0922/ttyd:latest
-    container_name: yunderaterminaltty
+    container_name: yunderaterminalpassttyd
     restart: unless-stopped
     user: "root"
     command: ["ttyd", "--writable", "--client-option", "enableZmodem=true", "--client-option", "enableSixel=false", "--client-option", "enableTrzsz=false", "--terminal-type", "xterm-256color", "chroot", "/host", "bash"]
@@ -53,18 +55,19 @@ x-casaos:
   architectures:
     - amd64
     - arm64
-  main: yunderaterminal
+  main: yunderaterminalpass
   author: yundera
   developer: yundera
   icon: https://cdn-icons-png.flaticon.com/512/2933/2933245.png
   tagline:
-    en_us: "Secure hash-locked terminal access"
+    en_us: "Secure password-protected terminal access"
   category: Utilities
   description:
-    en_us: "A secure terminal with hash-based authentication using nginxhashlock"
+    en_us: "A secure terminal with username/password authentication using nginxhashlock. Login with credentials for session-based access with configurable duration."
   title:
-    en_us: "Yundera Terminal"
-  store_app_id: yunderaterminal
+    en_us: "Yundera Terminal (Password Auth)"
+  store_app_id: yunderaterminalpass
   is_uncontrolled: false
-  index: /?hash=$AUTH_HASH
+  # nginxhashlock will show login page - no hash needed
+  index: /
   webui_port: 3000
