@@ -18,8 +18,34 @@ const fs = require('fs');
 const DYNAMIC_PATHS_FILE = process.env.DYNAMIC_PATHS_FILE || '/tmp/dynamic_paths/allowed.txt';
 const DEFAULT_TTL = 3600; // 1 hour in seconds
 const LISTEN_PORT = 9997;
-const AUTH_SERVICE_URL = 'http://127.0.0.1:9999/auth/check';
+const AUTH_SERVICE_URL = 'http://127.0.0.1:9999/nhl-auth/check';
 
+// Helper function to check if IP is from Docker internal network
+function isDockerInternalIP(ip) {
+    // Remove IPv6 prefix if present
+    ip = ip.replace(/^::ffff:/, '');
+
+    // Localhost
+    if (ip === '127.0.0.1' || ip === '::1') return true;
+
+    const parts = ip.split('.');
+    if (parts.length !== 4) return false;
+
+    const first = parseInt(parts[0]);
+    const second = parseInt(parts[1]);
+
+    // Docker network ranges
+    // 10.0.0.0/8
+    if (first === 10) return true;
+
+    // 172.16.0.0/12
+    if (first === 172 && second >= 16 && second <= 31) return true;
+
+    // 192.168.0.0/16
+    if (first === 192 && second === 168) return true;
+
+    return false;
+}
 
 const server = http.createServer((req, res) => {
     const originalUri = req.headers['x-original-uri'] || '';
@@ -29,6 +55,36 @@ const server = http.createServer((req, res) => {
 
     if (!hash) {
         res.writeHead(403);
+        res.end();
+        return;
+    }
+
+    // Handle request errors to prevent crashes
+    req.on('error', (err) => {
+        console.error('[AUTO-ADD] Request error:', err);
+        try {
+            res.writeHead(500);
+            res.end();
+        } catch (e) {
+            console.error('[AUTO-ADD] Failed to send error response:', e);
+        }
+    });
+
+    res.on('error', (err) => {
+        console.error('[AUTO-ADD] Response error:', err);
+    });
+
+    // Check if request is from Docker internal network (container-to-container)
+    const remoteAddr = req.headers['x-real-ip'] || req.connection.remoteAddress || '';
+    const isInternalRequest = isDockerInternalIP(remoteAddr);
+
+    if (isInternalRequest) {
+        // Internal requests from Stremio server itself - always allow and add to allowlist
+        console.log(`[AUTO-ADD] Internal request from ${remoteAddr} for hash ${hash} - bypassing auth`);
+        if (!isHashAllowed(hash)) {
+            addHashToAllowlist(hash);
+        }
+        res.writeHead(204);
         res.end();
         return;
     }
@@ -90,8 +146,9 @@ const server = http.createServer((req, res) => {
         }
     });
 
-    authReq.on('error', () => {
+    authReq.on('error', (err) => {
         // Auth service error - fall back to dynamic allowlist check
+        console.error('[AUTO-ADD] Auth service connection error:', err.message);
         if (isHashAllowed(hash)) {
             res.writeHead(204);
             res.end();
@@ -99,6 +156,12 @@ const server = http.createServer((req, res) => {
             res.writeHead(403);
             res.end();
         }
+    });
+
+    // Add timeout to prevent hanging connections
+    authReq.setTimeout(5000, () => {
+        console.error('[AUTO-ADD] Auth service request timeout');
+        authReq.destroy();
     });
 
     authReq.end();
@@ -167,10 +230,37 @@ function addHashToAllowlist(hash) {
     }
 }
 
+// Handle server-level errors
+server.on('error', (err) => {
+    console.error('[AUTO-ADD] Server error:', err);
+});
+
+server.on('clientError', (err, socket) => {
+    console.error('[AUTO-ADD] Client error:', err.message);
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+});
+
 server.listen(LISTEN_PORT, '127.0.0.1', () => {
     console.log(`[AUTO-ADD] Listening on port ${LISTEN_PORT}`);
 });
+
+// Prevent crashes from uncaught exceptions
+process.on('uncaughtException', (err) => {
+    console.error('[AUTO-ADD] Uncaught exception:', err);
+    console.error('[AUTO-ADD] Service continuing...');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[AUTO-ADD] Unhandled rejection at:', promise, 'reason:', reason);
+    console.error('[AUTO-ADD] Service continuing...');
+});
 JSEOF
 
-# Run the Node.js server
-exec node /tmp/auto-add-hash-server.js
+# Run the Node.js server with auto-restart
+while true; do
+    echo "[AUTO-ADD] Starting service..."
+    node /tmp/auto-add-hash-server.js
+    EXIT_CODE=$?
+    echo "[AUTO-ADD] Service exited with code $EXIT_CODE, restarting in 2 seconds..."
+    sleep 2
+done

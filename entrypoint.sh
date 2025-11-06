@@ -85,10 +85,8 @@ case "$AUTH_MODE" in
         ;;
 esac
 
-# Replace AUTH_CHECK_BLOCK_PLACEHOLDER with the generated block
-# Need to escape newlines and special characters for sed
+# Prepare authentication block for insertion (deferred until after dynamic paths configuration)
 AUTH_CHECK_ESCAPED=$(echo "$AUTH_CHECK_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
-sed -i "s/AUTH_CHECK_BLOCK_PLACEHOLDER/$AUTH_CHECK_ESCAPED/" /etc/nginx/nginx.conf
 
 # Handle ALLOWED_EXTENSIONS
 if [ -n "$ALLOWED_EXTENSIONS" ]; then
@@ -163,11 +161,26 @@ if [ -n "$DYNAMIC_PATHS_FILE" ]; then
 
     sleep 1
 
+    # Add geo block to detect Docker internal network requests
+    echo "Adding Docker internal network detection..."
+    if ! grep -q "geo \$docker_internal" /etc/nginx/nginx.conf; then
+        sed -i '/scgi_temp_path/a\
+\n    # Detect requests from Docker internal network (container-to-container)\
+    geo $docker_internal {\
+        default 0;\
+        127.0.0.1 1;           # Localhost\
+        10.0.0.0/8 1;          # Docker network range\
+        172.16.0.0/12 1;       # Docker network range\
+        192.168.0.0/16 1;      # Docker network range\
+    }' /etc/nginx/nginx.conf
+    fi
+
     # Create dynamic paths config file
     cat > /tmp/dynamic_paths.conf <<'EOF'
         # Dynamic path checking for temporary allowlist
         location ~ "^/[a-f0-9]{40}" {
-            # Combined auth check and auto-add (single auth_request)
+            # Internal Docker requests bypass auth (Stremio server probing itself)
+            # External requests go through auth
             auth_request /internal-dynamic-auth;
             error_page 401 = @auth_failed_dynamic;
 
@@ -219,20 +232,19 @@ EOF
 
     # Add session establishment logic (only when auth service is running AND we need sessions)
     # This is needed for "both" mode or when hash+dynamic paths (for auto-add service)
-    if [ "$AUTH_MODE" != "hash" ] && ! grep -q "/auth/establish-session" /etc/nginx/nginx.conf; then
+    if [ "$AUTH_MODE" != "hash" ] && ! grep -q "/nhl-auth/establish-session" /etc/nginx/nginx.conf; then
         # Add the map for session checking
         sed -i '/scgi_temp_path/a\
-\n    # Map to check if session establishment is needed\
-    map "$arg_hash:$http_cookie" $need_session {\
+\n    # Redirect to establish-session when hash parameter is present\
+    map $arg_hash $need_session {\
         default 0;\
-        "~^(.+):$" 1;  # Has hash arg but no cookie\
-        "~^(.+):(?!.*nginxhashlock_session)" 1;  # Has hash but no session cookie\
+        "~.+" 1;\
     }' /etc/nginx/nginx.conf
 
         # Add the establish-session endpoint
-        sed -i '/location \/auth\/ {/a\
-        location /auth/establish-session {\
-            proxy_pass http://127.0.0.1:9999/auth/establish-session;\
+        sed -i '/location \/nhl-auth\/ {/a\
+        location /nhl-auth/establish-session {\
+            proxy_pass http://127.0.0.1:9999/nhl-auth/establish-session;\
             proxy_http_version 1.1;\
             proxy_set_header Host $host;\
             proxy_set_header X-Real-IP $remote_addr;\
@@ -245,7 +257,7 @@ EOF
         sed -i '/AUTH_CHECK_BLOCK_PLACEHOLDER/a\
             # If hash parameter is present and no session cookie, redirect to establish session first\
             if ($need_session = 1) {\
-                return 307 /auth/establish-session?hash=$arg_hash\&return_to=$request_uri;\
+                return 307 /nhl-auth/establish-session?hash=$arg_hash\&return_to=$request_uri;\
             }' /etc/nginx/nginx.conf
     fi
 
@@ -254,6 +266,9 @@ EOF
 else
     echo "No dynamic paths configured"
 fi
+
+# Apply authentication block to nginx configuration
+sed -i "s/AUTH_CHECK_BLOCK_PLACEHOLDER/$AUTH_CHECK_ESCAPED/" /etc/nginx/nginx.conf
 
 echo "========================================="
 echo "Final nginx configuration:"

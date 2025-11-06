@@ -10,11 +10,17 @@ const PORT = 9999;
 // Configuration from environment
 const USERNAME = process.env.USER || '';
 const PASSWORD = process.env.PASSWORD || '';
+const AUTH_HASH = process.env.AUTH_HASH || '';
 const SESSION_DURATION_HOURS = parseInt(process.env.SESSION_DURATION_HOURS || '720', 10);
 const SESSION_DURATION_MS = SESSION_DURATION_HOURS * 60 * 60 * 1000;
 
+// Generate password hash for session validation
+// When password changes (container restart), password-based sessions become invalid
+const PASSWORD_HASH = crypto.createHash('sha256').update(PASSWORD + USERNAME).digest('hex');
+
 // In-memory session store
-// Format: { sessionId: { expires: timestamp } }
+// Format: { sessionId: { expires: timestamp, passwordHash?: string, authHash?: string } }
+// Sessions can be authenticated via password OR auth hash
 const sessions = {};
 
 // Generate secure random session ID
@@ -123,7 +129,7 @@ app.get('/login', (req, res) => {
 <body>
     <div class="container">
         <h1>🔒 Login Required</h1>
-        <form method="POST" action="/auth/login">
+        <form method="POST" action="/nhl-auth/login">
             <div class="form-group">
                 <label>Username</label>
                 <input type="text" name="username" required autofocus>
@@ -157,7 +163,7 @@ app.get('/login', (req, res) => {
 });
 
 // Handle login submission
-app.post('/auth/login', async (req, res) => {
+app.post('/nhl-auth/login', async (req, res) => {
     const { username, password, redirect } = req.body;
     const startTime = Date.now();
 
@@ -168,7 +174,8 @@ app.post('/auth/login', async (req, res) => {
         // Create session
         const sessionId = generateSessionId();
         sessions[sessionId] = {
-            expires: Date.now() + SESSION_DURATION_MS
+            expires: Date.now() + SESSION_DURATION_MS,
+            passwordHash: PASSWORD_HASH
         };
 
         console.log(`[Auth Service] Login successful for user: ${username}`);
@@ -197,14 +204,34 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // Auth check endpoint (called by nginx auth_request)
-app.get('/auth/check', (req, res) => {
+app.get('/nhl-auth/check', (req, res) => {
     // Check for existing session first
     let sessionId = req.cookies.nginxhashlock_session;
 
-    if (sessionId && sessions[sessionId] && sessions[sessionId].expires > Date.now()) {
-        // Valid session exists
-        console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...)`);
-        return res.status(200).send('OK');
+    if (sessionId && sessions[sessionId]) {
+        const session = sessions[sessionId];
+
+        // Check if session is expired
+        if (session.expires < Date.now()) {
+            console.log(`[Auth Service] Auth check failed: Session expired (${sessionId.substring(0, 8)}...)`);
+            delete sessions[sessionId];
+            // Continue to check other auth methods
+        }
+        // Check if credentials are still valid
+        else {
+            // Session is valid if EITHER password hash OR auth hash matches
+            const passwordValid = session.passwordHash && session.passwordHash === PASSWORD_HASH;
+            const authHashValid = session.authHash && session.authHash === AUTH_HASH;
+
+            if (passwordValid || authHashValid) {
+                console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...)`);
+                return res.status(200).send('OK');
+            } else {
+                console.log(`[Auth Service] Auth check failed: Credentials changed, invalidating session (${sessionId.substring(0, 8)}...)`);
+                delete sessions[sessionId];
+                // Continue to check other auth methods
+            }
+        }
     }
 
     // No valid session - check if hash parameter is valid
@@ -219,7 +246,8 @@ app.get('/auth/check', (req, res) => {
             if (!sessionId || !sessions[sessionId]) {
                 sessionId = generateSessionId();
                 sessions[sessionId] = {
-                    expires: Date.now() + SESSION_DURATION_MS
+                    expires: Date.now() + SESSION_DURATION_MS,
+                    authHash: AUTH_HASH
                 };
 
                 console.log(`[Auth Service] Session created for hash auth: ${sessionId.substring(0, 8)}... (expires in ${SESSION_DURATION_HOURS}h)`);
@@ -258,36 +286,57 @@ app.get('/auth/check', (req, res) => {
         return res.status(401).send('Unauthorized');
     }
 
+    // Check if password has changed
+    if (session.passwordHash && session.passwordHash !== PASSWORD_HASH) {
+        console.log(`[Auth Service] Auth check failed: Password changed, invalidating session (${sessionId.substring(0, 8)}...)`);
+        delete sessions[sessionId];
+        return res.status(401).send('Unauthorized');
+    }
+
     // Session is valid
     console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...)`);
     res.status(200).send('OK');
 });
 
 // Establish session endpoint (for hash authentication to set cookies properly)
-app.get('/auth/establish-session', (req, res) => {
+app.get('/nhl-auth/establish-session', (req, res) => {
     // Check if hash parameter is valid
     if (process.env.AUTH_HASH) {
         const hash = req.query.hash;
-        const returnTo = req.query.return_to || '/';
+        let returnTo = req.query.return_to || '/';
+
+        // Strip hash parameter from return URL to prevent redirect loop
+        returnTo = returnTo.replace(/[?&]hash=[^&]+(&|$)/, (match, p1) => p1 === '&' ? '&' : '?').replace(/[?&]$/, '').replace(/\?$/, '') || '/';
 
         if (hash && hash === process.env.AUTH_HASH) {
             // Check if session already exists
             let sessionId = req.cookies.nginxhashlock_session;
 
-            if (sessionId && sessions[sessionId] && sessions[sessionId].expires > Date.now()) {
-                // Valid session already exists
-                console.log(`[Auth Service] Session already valid: ${sessionId.substring(0, 8)}...`);
-                // Redirect back if requested
-                if (req.query.return_to) {
-                    return res.redirect(returnTo);
+            if (sessionId && sessions[sessionId]) {
+                const session = sessions[sessionId];
+                // Check if session is valid (not expired and credentials are still valid)
+                const passwordValid = session.passwordHash && session.passwordHash === PASSWORD_HASH;
+                const authHashValid = session.authHash && session.authHash === AUTH_HASH;
+
+                if (session.expires > Date.now() && (passwordValid || authHashValid)) {
+                    // Valid session already exists
+                    console.log(`[Auth Service] Session already valid: ${sessionId.substring(0, 8)}...`);
+                    // Redirect back if requested
+                    if (req.query.return_to) {
+                        return res.redirect(returnTo);
+                    }
+                    return res.status(200).json({ status: 'ok', message: 'Session already valid' });
+                } else {
+                    // Session expired or password changed, delete it
+                    delete sessions[sessionId];
                 }
-                return res.status(200).json({ status: 'ok', message: 'Session already valid' });
             }
 
             // Create new session
             sessionId = generateSessionId();
             sessions[sessionId] = {
-                expires: Date.now() + SESSION_DURATION_MS
+                expires: Date.now() + SESSION_DURATION_MS,
+                authHash: AUTH_HASH
             };
 
             console.log(`[Auth Service] Session established via hash: ${sessionId.substring(0, 8)}... (expires in ${SESSION_DURATION_HOURS}h)`);

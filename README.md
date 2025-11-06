@@ -205,6 +205,12 @@ ALLOWED_PATHS: "login,about,api/health,api/public"
 
 Now `/login` and `/api/health` work without a hash, but `/dashboard` still requires it.
 
+**Important - Reserved Paths:**
+- `/nhl-auth/` is reserved for internal authentication endpoints and cannot be used in ALLOWED_PATHS
+- `/login` is reserved for the login page
+- All other paths are available for use in ALLOWED_PATHS
+- The `/auth` path is now available for your application (previously reserved)
+
 ## Dynamic Path Allowlisting (Advanced Feature)
 
 ### What Problem Does It Solve?
