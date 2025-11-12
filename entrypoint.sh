@@ -3,12 +3,72 @@
 echo "Starting nginxhashlock..."
 
 # Copy template to working config
-cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+if ! cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup; then
+    echo "ERROR: Failed to backup nginx config"
+    exit 1
+fi
+
+# Validate inputs before using in sed replacements
+if ! echo "$BACKEND_HOST" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+    echo "ERROR: Invalid BACKEND_HOST (only alphanumeric, dots, underscores, and hyphens allowed)"
+    exit 1
+fi
+
+if ! echo "$BACKEND_PORT" | grep -qE '^[0-9]+$' || [ "$BACKEND_PORT" -lt 1 ] || [ "$BACKEND_PORT" -gt 65535 ]; then
+    echo "ERROR: Invalid BACKEND_PORT (must be 1-65535)"
+    exit 1
+fi
+
+if ! echo "$LISTEN_PORT" | grep -qE '^[0-9]+$' || [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
+    echo "ERROR: Invalid LISTEN_PORT (must be 1-65535)"
+    exit 1
+fi
 
 # Replace basic placeholders
 sed -i "s/BACKEND_HOST_PLACEHOLDER/$BACKEND_HOST/g" /etc/nginx/nginx.conf
 sed -i "s/BACKEND_PORT_PLACEHOLDER/$BACKEND_PORT/g" /etc/nginx/nginx.conf
 sed -i "s/LISTEN_PORT_PLACEHOLDER/$LISTEN_PORT/g" /etc/nginx/nginx.conf
+
+# Subdomain hash extraction setup
+SUBDOMAIN_HASH_ENABLED="${SUBDOMAIN_HASH_ENABLED:-false}"
+BACKEND_HASH="${BACKEND_HASH:-serverhash}"
+SUBDOMAIN_PATTERN="${SUBDOMAIN_PATTERN:-^([^-]+)-}"
+SUBDOMAIN_HASH_LENGTH="${SUBDOMAIN_HASH_LENGTH:-24}"
+
+# Validate SUBDOMAIN_PATTERN to prevent injection (only allow safe regex chars)
+if [ "$SUBDOMAIN_HASH_ENABLED" = "true" ] && ! echo "$SUBDOMAIN_PATTERN" | grep -qE '^[\^$()[\].+*?|-]+$'; then
+    echo "ERROR: Invalid SUBDOMAIN_PATTERN (only basic regex characters allowed)"
+    exit 1
+fi
+
+# Validate secondary backend if dual routing is enabled
+if [ -n "$SECONDARY_BACKEND_HOST" ]; then
+    if ! echo "$SECONDARY_BACKEND_HOST" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+        echo "ERROR: Invalid SECONDARY_BACKEND_HOST"
+        exit 1
+    fi
+fi
+
+if [ -n "$SECONDARY_BACKEND_PORT" ]; then
+    if ! echo "$SECONDARY_BACKEND_PORT" | grep -qE '^[0-9]+$' || [ "$SECONDARY_BACKEND_PORT" -lt 1 ] || [ "$SECONDARY_BACKEND_PORT" -gt 65535 ]; then
+        echo "ERROR: Invalid SECONDARY_BACKEND_PORT (must be 1-65535)"
+        exit 1
+    fi
+fi
+
+if [ "$SUBDOMAIN_HASH_ENABLED" = "true" ]; then
+    # Truncate backend hash to specified length for subdomain comparison
+    # This addresses DNS label length limits (63 chars max)
+    SUBDOMAIN_HASH_SHORT=$(echo "$BACKEND_HASH" | cut -c1-"$SUBDOMAIN_HASH_LENGTH")
+    echo "Subdomain hash extraction enabled"
+    echo "Pattern: $SUBDOMAIN_PATTERN"
+    echo "Backend hash: $BACKEND_HASH"
+    echo "Subdomain hash (first $SUBDOMAIN_HASH_LENGTH chars): $SUBDOMAIN_HASH_SHORT"
+fi
+
+# Secondary backend for dual routing
+SECONDARY_BACKEND_HOST="${SECONDARY_BACKEND_HOST:-}"
+SECONDARY_BACKEND_PORT="${SECONDARY_BACKEND_PORT:-}"
 
 # Determine authentication mode
 AUTH_MODE="none"
@@ -22,6 +82,12 @@ fi
 
 echo "========================================="
 echo "Authentication Mode: $AUTH_MODE"
+if [ "$SUBDOMAIN_HASH_ENABLED" = "true" ]; then
+    echo "Subdomain Routing: Enabled"
+fi
+if [ -n "$SECONDARY_BACKEND_HOST" ]; then
+    echo "Secondary Backend: $SECONDARY_BACKEND_HOST:$SECONDARY_BACKEND_PORT"
+fi
 echo "========================================="
 
 # Start auth service if credentials are configured
@@ -34,8 +100,37 @@ if [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ]; then
     echo "Auth service started with PID: $AUTH_SERVICE_PID"
     cd /
 
-    # Wait for auth service to be ready
-    sleep 2
+    # Wait for auth service to be ready with timeout
+    echo "Waiting for auth service to be ready..."
+    TIMEOUT=10
+    for i in $(seq 1 $TIMEOUT); do
+        # Try curl first, fall back to nc (netcat) port check
+        if command -v curl > /dev/null 2>&1; then
+            if curl -sf --max-time 2 http://127.0.0.1:9999/health > /dev/null 2>&1; then
+                echo "Auth service is ready"
+                break
+            fi
+        elif command -v nc > /dev/null 2>&1; then
+            if nc -z 127.0.0.1 9999 > /dev/null 2>&1; then
+                echo "Auth service is ready (port check)"
+                break
+            fi
+        else
+            # No curl or nc available, just wait and trust the logs
+            if [ $i -ge 3 ]; then
+                echo "Auth service assumed ready (no health check tools available)"
+                break
+            fi
+        fi
+
+        if [ $i -eq $TIMEOUT ]; then
+            echo "ERROR: Auth service failed to start within ${TIMEOUT}s"
+            echo "Last 20 lines of auth service log:"
+            tail -20 /var/log/auth-service.log
+            exit 1
+        fi
+        sleep 1
+    done
 fi
 
 # Build the authentication check block based on AUTH_MODE
@@ -85,8 +180,7 @@ case "$AUTH_MODE" in
         ;;
 esac
 
-# Prepare authentication block for insertion (deferred until after dynamic paths configuration)
-AUTH_CHECK_ESCAPED=$(echo "$AUTH_CHECK_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
+# Note: AUTH_CHECK_BLOCK will be escaped and inserted later (after all modifications)
 
 # Handle ALLOWED_EXTENSIONS
 if [ -n "$ALLOWED_EXTENSIONS" ]; then
@@ -128,121 +222,115 @@ else
     sed -i '/# Allow specific paths/,/^        }/d' /etc/nginx/nginx.conf
 fi
 
-# Handle DYNAMIC_PATHS (optional - for temporary path allowlisting)
-if [ -n "$DYNAMIC_PATHS_FILE" ]; then
-    echo "Configuring dynamic paths with file: $DYNAMIC_PATHS_FILE"
+# Dynamic paths are no longer used - using subdomain authentication instead
 
-    # Create the directory if it doesn't exist
-    DYNAMIC_DIR=$(dirname "$DYNAMIC_PATHS_FILE")
-    mkdir -p "$DYNAMIC_DIR"
+# Handle hash-authenticated path (optional, for app cross-device auth)
+HASH_AUTH_PATH="${HASH_AUTH_PATH:-}"
 
-    # Create empty file if it doesn't exist
-    touch "$DYNAMIC_PATHS_FILE"
+if [ -n "$HASH_AUTH_PATH" ]; then
+    echo "Configuring hash-authenticated path: $HASH_AUTH_PATH"
 
-    # Default TTL is 5 minutes if not specified
-    export DYNAMIC_PATHS_TTL="${DYNAMIC_PATHS_TTL:-300}"
+    # Build the hash auth path block
+    HASH_AUTH_BLOCK="        # Dedicated hash-authenticated path for cross-device app authentication
+        location ~ ^${HASH_AUTH_PATH}(/.*)?$ {
+            # Hash validation happens in auth check
+            auth_request /internal-auth-check;
+            error_page 401 = @auth_failed_hashpath;
 
-    # Start the dynamic auth checker service
-    echo "Starting dynamic auth checker service..."
-    # Fix any CRLF line endings
-    dos2unix /dynamic-auth-checker.sh 2>/dev/null || sed -i 's/\r$//' /dynamic-auth-checker.sh
-    chmod +x /dynamic-auth-checker.sh
-    sh /dynamic-auth-checker.sh > /var/log/dynamic-auth.log 2>&1 &
-    DYNAMIC_AUTH_PID=$!
-    echo "Dynamic auth checker started with PID: $DYNAMIC_AUTH_PID"
+            # Capture the path after prefix
+            set \$backend_path \$1;
+            if (\$backend_path = \"\") {
+                set \$backend_path \"/\";
+            }
 
-    # Start the auto-add hash service
-    echo "Starting auto-add hash service..."
-    dos2unix /auto-add-hash.sh 2>/dev/null || sed -i 's/\r$//' /auto-add-hash.sh
-    chmod +x /auto-add-hash.sh
-    sh /auto-add-hash.sh > /var/log/auto-add-hash.log 2>&1 &
-    AUTO_ADD_PID=$!
-    echo "Auto-add hash service started with PID: $AUTO_ADD_PID"
-
-    sleep 1
-
-    # Add geo block to detect Docker internal network requests
-    echo "Adding Docker internal network detection..."
-    if ! grep -q "geo \$docker_internal" /etc/nginx/nginx.conf; then
-        sed -i '/scgi_temp_path/a\
-\n    # Detect requests from Docker internal network (container-to-container)\
-    geo $docker_internal {\
-        default 0;\
-        127.0.0.1 1;           # Localhost\
-        10.0.0.0/8 1;          # Docker network range\
-        172.16.0.0/12 1;       # Docker network range\
-        192.168.0.0/16 1;      # Docker network range\
-    }' /etc/nginx/nginx.conf
-    fi
-
-    # Create dynamic paths config file
-    cat > /tmp/dynamic_paths.conf <<'EOF'
-        # Dynamic path checking for temporary allowlist
-        location ~ "^/[a-f0-9]{40}" {
-            # Internal Docker requests bypass auth (Stremio server probing itself)
-            # External requests go through auth
-            auth_request /internal-dynamic-auth;
-            error_page 401 = @auth_failed_dynamic;
-
-            proxy_pass http://BACKEND_HOST_PLACEHOLDER:BACKEND_PORT_PLACEHOLDER;
+            # Proxy to backend, stripping prefix but keeping query string
+            proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}\$backend_path\$is_args\$args;
             proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection "upgrade";
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \"upgrade\";
         }
 
-        location @auth_failed_dynamic {
-            return 302 /login?redirect=$request_uri;
+        location @auth_failed_hashpath {
+            default_type application/json;
+            return 401 '{\"error\": \"Unauthorized\", \"message\": \"Invalid or missing hash\"}';
         }
+"
 
-        location = /internal-dynamic-auth {
+    # Escape for sed
+    HASH_AUTH_ESCAPED=$(echo "$HASH_AUTH_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
+    sed -i "s/HASH_AUTH_PATH_BLOCK_PLACEHOLDER/$HASH_AUTH_ESCAPED/" /etc/nginx/nginx.conf
+else
+    echo "No hash-authenticated path configured"
+    # Remove the placeholder
+    sed -i '/HASH_AUTH_PATH_BLOCK_PLACEHOLDER/d' /etc/nginx/nginx.conf
+fi
+
+# Handle subdomain hash extraction and dual routing
+if [ "$SUBDOMAIN_HASH_ENABLED" = "true" ] && [ -n "$BACKEND_HASH" ]; then
+    echo "Configuring subdomain hash extraction..."
+
+    # Add map directive for subdomain hash extraction
+    SUBDOMAIN_MAP="
+    # Extract hash from subdomain using configured pattern
+    map \$host \$subdomain_hash {
+        default \"\";
+        ~$SUBDOMAIN_PATTERN \$1;
+    }"
+
+    SUBDOMAIN_MAP_ESCAPED=$(echo "$SUBDOMAIN_MAP" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
+    sed -i "s/SUBDOMAIN_HASH_MAP_PLACEHOLDER/$SUBDOMAIN_MAP_ESCAPED/" /etc/nginx/nginx.conf
+
+    # Add dual routing logic if secondary backend is configured
+    if [ -n "$SECONDARY_BACKEND_HOST" ] && [ -n "$SECONDARY_BACKEND_PORT" ]; then
+        echo "Configuring dual backend routing..."
+
+        # Add internal proxy locations before main location
+        DUAL_ROUTING_BLOCK="
+        # Internal proxy to primary backend
+        location /primary_backend_proxy {
             internal;
-            proxy_pass http://127.0.0.1:9997;
-            proxy_pass_request_body off;
-            proxy_set_header Content-Length "";
-            proxy_set_header X-Original-URI $request_uri;
-            proxy_set_header Cookie $http_cookie;
-            proxy_set_header Referer $http_referer;
+            rewrite ^/primary_backend_proxy(.*)\$ \$1 break;
+            proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host \$host;
+            proxy_cache_bypass \$http_upgrade;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+
+            # Increase timeouts for video streaming/transcoding operations
+            proxy_connect_timeout 300s;
+            proxy_send_timeout 300s;
+            proxy_read_timeout 300s;
+            send_timeout 300s;
         }
 
-        location = /internal-dynamic-check {
+        # Internal proxy to secondary backend
+        location /secondary_backend_proxy {
             internal;
-            proxy_pass http://127.0.0.1:9998;
-            proxy_pass_request_body off;
-            proxy_set_header Content-Length "";
-            proxy_set_header X-Original-URI $request_uri;
+            rewrite ^/secondary_backend_proxy(.*)\$ \$1 break;
+            proxy_pass http://${SECONDARY_BACKEND_HOST}:${SECONDARY_BACKEND_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host \$host;
+            proxy_cache_bypass \$http_upgrade;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         }
+"
 
-        location @require_auth {
-            # Fall back to main auth flow
-            return 418;
-        }
-EOF
+        DUAL_ROUTING_ESCAPED=$(echo "$DUAL_ROUTING_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
+        sed -i "0,/# Main location/s//$DUAL_ROUTING_ESCAPED\\n        &/" /etc/nginx/nginx.conf
 
-    # Replace placeholders in dynamic paths config
-    sed -i "s/BACKEND_HOST_PLACEHOLDER/$BACKEND_HOST/g" /tmp/dynamic_paths.conf
-    sed -i "s/BACKEND_PORT_PLACEHOLDER/$BACKEND_PORT/g" /tmp/dynamic_paths.conf
-
-    # Insert the include directive before main location (only if not already present)
-    if ! grep -q "include /tmp/dynamic_paths.conf" /etc/nginx/nginx.conf; then
-        sed -i '0,/# Main location - authentication logic/s//        include \/tmp\/dynamic_paths.conf;\n&/' /etc/nginx/nginx.conf
-    fi
-
-    # Add session establishment logic (only when auth service is running AND we need sessions)
-    # This is needed for "both" mode or when hash+dynamic paths (for auto-add service)
-    if [ "$AUTH_MODE" != "hash" ] && ! grep -q "/nhl-auth/establish-session" /etc/nginx/nginx.conf; then
-        # Add the map for session checking
-        sed -i '/scgi_temp_path/a\
-\n    # Redirect to establish-session when hash parameter is present\
-    map $arg_hash $need_session {\
-        default 0;\
-        "~.+" 1;\
-    }' /etc/nginx/nginx.conf
-
-        # Add the establish-session endpoint
-        sed -i '/location \/nhl-auth\/ {/a\
+        # Add session establishment support for hash-based auth
+        # Browser requests with ?hash= need to establish a session first
+        if ! grep -q "establish-session" /etc/nginx/nginx.conf; then
+            sed -i '/location \/nhl-auth\/ {/a\
         location /nhl-auth/establish-session {\
             proxy_pass http://127.0.0.1:9999/nhl-auth/establish-session;\
             proxy_http_version 1.1;\
@@ -252,23 +340,89 @@ EOF
             proxy_set_header Cookie $http_cookie;\
         }\
 ' /etc/nginx/nginx.conf
+        fi
 
-        # Add the redirect logic in main location
-        sed -i '/AUTH_CHECK_BLOCK_PLACEHOLDER/a\
-            # If hash parameter is present and no session cookie, redirect to establish session first\
-            if ($need_session = 1) {\
-                return 307 /nhl-auth/establish-session?hash=$arg_hash\&return_to=$request_uri;\
-            }' /etc/nginx/nginx.conf
+        # Modify AUTH_CHECK_BLOCK to include routing logic
+        # Use shortened hash for subdomain comparison (DNS label limits)
+        ROUTING_LOGIC="
+            # Check if subdomain hash matches (routes to primary backend)
+            if (\$subdomain_hash = \"$SUBDOMAIN_HASH_SHORT\") {
+                rewrite ^ /primary_backend_proxy\$uri last;
+            }
+
+            # If subdomain hash is present but doesn't match, BLOCK (not authenticated)
+            set \$block 0;
+            if (\$subdomain_hash != \"\") {
+                set \$block 1;
+            }
+            if (\$block = 1) {
+                return 403;
+            }
+
+            # Browser requests with ?hash= redirect to establish session
+            set \$need_session 0;
+            if (\$arg_hash != \"\") {
+                set \$need_session 1;
+            }
+            if (\$http_accept ~* \"text/html\") {
+                set \$need_session \${need_session}1;
+            }
+            if (\$need_session = 11) {
+                return 307 /nhl-auth/establish-session?hash=\$arg_hash&return_to=\$uri;
+            }
+
+            # Only if no subdomain hash: use normal auth for secondary backend
+            auth_request /internal-auth-check;
+            error_page 401 = @auth_failed_login;
+
+            # If auth succeeds, proxy directly to secondary backend (no rewrite)
+            proxy_pass http://${SECONDARY_BACKEND_HOST}:${SECONDARY_BACKEND_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host \$host;
+            proxy_cache_bypass \$http_upgrade;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+
+        AUTH_CHECK_BLOCK="$ROUTING_LOGIC"
+
+        # Add auth failure handler (only if not already present)
+        if ! grep -q "location @auth_failed_login" /etc/nginx/nginx.conf; then
+            sed -i 's|location / {|location @auth_failed_login {\
+            return 302 /login?redirect=$request_uri;\
+        }\
+\
+        location / {|' /etc/nginx/nginx.conf
+        fi
+
+        # Remove the backend proxy block placeholder since routing is handled by internal locations
+        sed -i '/BACKEND_PROXY_BLOCK_PLACEHOLDER/d' /etc/nginx/nginx.conf
     fi
-
-
-    echo "Dynamic paths TTL: $DYNAMIC_PATHS_TTL seconds"
 else
-    echo "No dynamic paths configured"
+    # Remove placeholder if subdomain hash not enabled
+    sed -i '/SUBDOMAIN_HASH_MAP_PLACEHOLDER/d' /etc/nginx/nginx.conf
 fi
 
 # Apply authentication block to nginx configuration
+AUTH_CHECK_ESCAPED=$(echo "$AUTH_CHECK_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g' | sed 's/&/\\&/g')
 sed -i "s/AUTH_CHECK_BLOCK_PLACEHOLDER/$AUTH_CHECK_ESCAPED/" /etc/nginx/nginx.conf
+
+# Apply backend proxy block if not using dual routing
+if grep -q "BACKEND_PROXY_BLOCK_PLACEHOLDER" /etc/nginx/nginx.conf; then
+    echo "Adding default backend proxy block"
+    BACKEND_PROXY_BLOCK="            proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
+            proxy_http_version 1.1;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header Upgrade \$http_upgrade;
+            proxy_set_header Connection \"upgrade\";
+            proxy_set_header Cookie \$http_cookie;"
+
+    BACKEND_PROXY_ESCAPED=$(echo "$BACKEND_PROXY_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
+    sed -i "s/BACKEND_PROXY_BLOCK_PLACEHOLDER/$BACKEND_PROXY_ESCAPED/" /etc/nginx/nginx.conf
+fi
 
 echo "========================================="
 echo "Final nginx configuration:"

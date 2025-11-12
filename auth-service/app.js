@@ -237,7 +237,10 @@ app.get('/nhl-auth/check', (req, res) => {
     // No valid session - check if hash parameter is valid
     if (process.env.AUTH_HASH) {
         const originalUri = req.headers['x-original-uri'] || '';
-        const hashMatch = originalUri.match(/[?&]hash=([^&]+)/);
+        const referer = req.headers['referer'] || '';
+
+        // Check hash in current request or referer (for app subsequent requests)
+        const hashMatch = originalUri.match(/[?&]hash=([^&]+)/) || referer.match(/[?&]hash=([^&]+)/);
 
         if (hashMatch && hashMatch[1] === process.env.AUTH_HASH) {
             console.log('[Auth Service] Auth check passed via hash parameter');

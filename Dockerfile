@@ -27,11 +27,9 @@ COPY auth-service /app/auth-service
 WORKDIR /app/auth-service
 RUN npm install --production
 
-# Copy entrypoint, dynamic auth checker, and auto-add hash scripts
+# Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh
-COPY dynamic-auth-checker.sh /dynamic-auth-checker.sh
-COPY auto-add-hash.sh /auto-add-hash.sh
-RUN chmod +x /entrypoint.sh /dynamic-auth-checker.sh /auto-add-hash.sh
+RUN chmod +x /entrypoint.sh
 
 WORKDIR /
 
