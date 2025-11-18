@@ -2,9 +2,16 @@
 
 echo "Starting nginxhashlock..."
 
-# Copy template to working config
-if ! cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup; then
-    echo "ERROR: Failed to backup nginx config"
+# On first run, save the original template
+if [ ! -f /etc/nginx/nginx.conf.template ]; then
+    echo "Saving original nginx.conf as template..."
+    cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.template
+fi
+
+# Always start with a clean copy from template
+echo "Copying clean template to working config..."
+if ! cp /etc/nginx/nginx.conf.template /etc/nginx/nginx.conf; then
+    echo "ERROR: Failed to copy template to working config"
     exit 1
 fi
 
@@ -201,12 +208,12 @@ fi
 # Handle ALLOWED_PATHS
 if [ -n "$ALLOWED_PATHS" ]; then
     echo "Configuring allowed paths: $ALLOWED_PATHS"
-    # Normalize paths: strip leading/trailing slashes from each comma-separated value
+    # Normalize paths: strip leading/trailing slashes and spaces from each comma-separated value
     # This handles: "/guild,/auth" -> "guild,auth"
-    #              "login,/api/health/,/guild" -> "login,api/health,guild"
+    #              "login, /api/health/, /guild" -> "login,api/health,guild"
     #              "page/\",/something/else/" -> "page/\",something/else"
     NORMALIZED_PATHS=$(echo "$ALLOWED_PATHS" | \
-        sed 's/^\/\+//;s/\/\+$//;s/,\/\+/,/g;s/\/\+,/,/g' | \
+        sed 's/^[ \/]\+//;s/[ \/]\+$//;s/[ \/]\+,/,/g;s/,[ \/]\+/,/g' | \
         sed 's/,\+/,/g')
     echo "Normalized paths: $NORMALIZED_PATHS"
     # Convert comma-separated to regex format: login,api/health -> (login|api/health)
@@ -324,13 +331,22 @@ if [ "$SUBDOMAIN_HASH_ENABLED" = "true" ] && [ -n "$BACKEND_HASH" ]; then
         }
 "
 
-        DUAL_ROUTING_ESCAPED=$(echo "$DUAL_ROUTING_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
-        sed -i "0,/# Main location/s//$DUAL_ROUTING_ESCAPED\\n        &/" /etc/nginx/nginx.conf
+        # Only insert if primary_backend_proxy doesn't already exist
+        if ! grep -q "location /primary_backend_proxy" /etc/nginx/nginx.conf; then
+            DUAL_ROUTING_ESCAPED=$(echo "$DUAL_ROUTING_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
+            sed -i "0,/# Main location/s//$DUAL_ROUTING_ESCAPED\\n        &/" /etc/nginx/nginx.conf
+        else
+            echo "primary_backend_proxy location already exists, skipping insertion"
+        fi
 
         # Add session establishment support for hash-based auth
         # Browser requests with ?hash= need to establish a session first
         if ! grep -q "establish-session" /etc/nginx/nginx.conf; then
-            sed -i '/location \/nhl-auth\/ {/a\
+            # Insert after the /nhl-auth/ location block (after its closing brace)
+            # Find the /nhl-auth/ block and insert the new block after it
+            sed -i '/location \/nhl-auth\/ {/,/^        }/ {
+                /^        }/a\
+\
         location /nhl-auth/establish-session {\
             proxy_pass http://127.0.0.1:9999/nhl-auth/establish-session;\
             proxy_http_version 1.1;\
@@ -338,8 +354,8 @@ if [ "$SUBDOMAIN_HASH_ENABLED" = "true" ] && [ -n "$BACKEND_HASH" ]; then
             proxy_set_header X-Real-IP $remote_addr;\
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\
             proxy_set_header Cookie $http_cookie;\
-        }\
-' /etc/nginx/nginx.conf
+        }
+            }' /etc/nginx/nginx.conf
         fi
 
         # Modify AUTH_CHECK_BLOCK to include routing logic
