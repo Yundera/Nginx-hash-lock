@@ -114,6 +114,8 @@ case "$AUTH_MODE" in
         echo "Credentials-only authentication configured"
         AUTH_CHECK_BLOCK="            # Credentials-only authentication
             auth_request /internal-auth-check;
+            auth_request_set \$auth_cookie \$upstream_http_set_cookie;
+            add_header Set-Cookie \$auth_cookie;
             error_page 401 = @auth_failed_login;"
 
         # Add named location for auth failure handling
@@ -128,6 +130,8 @@ case "$AUTH_MODE" in
         echo "Both hash and credentials authentication configured"
         AUTH_CHECK_BLOCK="            # Auth service checks both hash and session
             auth_request /internal-auth-check;
+            auth_request_set \$auth_cookie \$upstream_http_set_cookie;
+            add_header Set-Cookie \$auth_cookie;
             error_page 401 = @auth_failed_login;"
 
         # Use same simple redirect as credentials_only
@@ -237,6 +241,8 @@ if [ -n "$DYNAMIC_PATHS_FILE" ]; then
             # Internal Docker requests bypass auth (Stremio server probing itself)
             # External requests go through auth
             auth_request /internal-dynamic-auth;
+            auth_request_set $auth_cookie $upstream_http_set_cookie;
+            add_header Set-Cookie $auth_cookie;
             error_page 401 = @auth_failed_dynamic;
 
             proxy_pass http://BACKEND_HOST_PLACEHOLDER:BACKEND_PORT_PLACEHOLDER;
