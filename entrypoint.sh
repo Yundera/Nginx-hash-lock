@@ -187,145 +187,33 @@ else
     sed -i '/# Allow specific paths/,/^        }/d' /etc/nginx/nginx.conf
 fi
 
-# Handle DYNAMIC_PATHS (optional - for temporary path allowlisting)
-if [ -n "$DYNAMIC_PATHS_FILE" ]; then
-    echo "Configuring dynamic paths with file: $DYNAMIC_PATHS_FILE"
+# Handle ALLOW_HASH_CONTENT_PATHS (for Stremio and similar apps that use 40-char hex paths)
+if [ "$ALLOW_HASH_CONTENT_PATHS" = "true" ] || [ "$ALLOW_HASH_CONTENT_PATHS" = "1" ]; then
+    echo "Enabling hash content paths bypass (40-character hex paths)"
 
-    # Create the directory if it doesn't exist
-    DYNAMIC_DIR=$(dirname "$DYNAMIC_PATHS_FILE")
-    mkdir -p "$DYNAMIC_DIR"
-
-    # Create empty file if it doesn't exist
-    touch "$DYNAMIC_PATHS_FILE"
-
-    # Default TTL is 5 minutes if not specified
-    export DYNAMIC_PATHS_TTL="${DYNAMIC_PATHS_TTL:-300}"
-
-    # Start the dynamic auth checker service
-    echo "Starting dynamic auth checker service..."
-    # Fix any CRLF line endings
-    dos2unix /dynamic-auth-checker.sh 2>/dev/null || sed -i 's/\r$//' /dynamic-auth-checker.sh
-    chmod +x /dynamic-auth-checker.sh
-    sh /dynamic-auth-checker.sh > /var/log/dynamic-auth.log 2>&1 &
-    DYNAMIC_AUTH_PID=$!
-    echo "Dynamic auth checker started with PID: $DYNAMIC_AUTH_PID"
-
-    # Start the auto-add hash service
-    echo "Starting auto-add hash service..."
-    dos2unix /auto-add-hash.sh 2>/dev/null || sed -i 's/\r$//' /auto-add-hash.sh
-    chmod +x /auto-add-hash.sh
-    sh /auto-add-hash.sh > /var/log/auto-add-hash.log 2>&1 &
-    AUTO_ADD_PID=$!
-    echo "Auto-add hash service started with PID: $AUTO_ADD_PID"
-
-    sleep 1
-
-    # Add geo block to detect Docker internal network requests
-    echo "Adding Docker internal network detection..."
-    if ! grep -q "geo \$docker_internal" /etc/nginx/nginx.conf; then
-        sed -i '/scgi_temp_path/a\
-\n    # Detect requests from Docker internal network (container-to-container)\
-    geo $docker_internal {\
-        default 0;\
-        127.0.0.1 1;           # Localhost\
-        10.0.0.0/8 1;          # Docker network range\
-        172.16.0.0/12 1;       # Docker network range\
-        192.168.0.0/16 1;      # Docker network range\
-    }' /etc/nginx/nginx.conf
-    fi
-
-    # Create dynamic paths config file
-    cat > /tmp/dynamic_paths.conf <<'EOF'
-        # Dynamic path checking for temporary allowlist
+    # Create hash paths config file - allows paths like /bca2d44dcd7655ecfdffe81659a569d3525f0195/...
+    cat > /tmp/hash_content_paths.conf <<EOF
+        # Allow 40-character hex content paths without authentication
+        # Used by Stremio and similar apps where the hash itself is the access token
         location ~ "^/[a-f0-9]{40}" {
-            # Internal Docker requests bypass auth (Stremio server probing itself)
-            # External requests go through auth
-            auth_request /internal-dynamic-auth;
-            auth_request_set $auth_cookie $upstream_http_set_cookie;
-            add_header Set-Cookie $auth_cookie;
-            error_page 401 = @auth_failed_dynamic;
-
-            proxy_pass http://BACKEND_HOST_PLACEHOLDER:BACKEND_PORT_PLACEHOLDER;
+            proxy_pass http://$BACKEND_HOST:$BACKEND_PORT;
             proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection "upgrade";
-        }
-
-        location @auth_failed_dynamic {
-            return 302 /login?redirect=$request_uri;
-        }
-
-        location = /internal-dynamic-auth {
-            internal;
-            proxy_pass http://127.0.0.1:9997;
-            proxy_pass_request_body off;
-            proxy_set_header Content-Length "";
-            proxy_set_header X-Original-URI $request_uri;
-            proxy_set_header Cookie $http_cookie;
-            proxy_set_header Referer $http_referer;
-        }
-
-        location = /internal-dynamic-check {
-            internal;
-            proxy_pass http://127.0.0.1:9998;
-            proxy_pass_request_body off;
-            proxy_set_header Content-Length "";
-            proxy_set_header X-Original-URI $request_uri;
-        }
-
-        location @require_auth {
-            # Fall back to main auth flow
-            return 418;
         }
 EOF
 
-    # Replace placeholders in dynamic paths config
-    sed -i "s/BACKEND_HOST_PLACEHOLDER/$BACKEND_HOST/g" /tmp/dynamic_paths.conf
-    sed -i "s/BACKEND_PORT_PLACEHOLDER/$BACKEND_PORT/g" /tmp/dynamic_paths.conf
-
-    # Insert the include directive before main location (only if not already present)
-    if ! grep -q "include /tmp/dynamic_paths.conf" /etc/nginx/nginx.conf; then
-        sed -i '0,/# Main location - authentication logic/s//        include \/tmp\/dynamic_paths.conf;\n&/' /etc/nginx/nginx.conf
+    # Insert the include directive before main location
+    if ! grep -q "include /tmp/hash_content_paths.conf" /etc/nginx/nginx.conf; then
+        sed -i '0,/# Main location - authentication logic/s//        include \/tmp\/hash_content_paths.conf;\n\n        &/' /etc/nginx/nginx.conf
     fi
 
-    # Add session establishment logic (only when auth service is running AND we need sessions)
-    # This is needed for "both" mode or when hash+dynamic paths (for auto-add service)
-    if [ "$AUTH_MODE" != "hash" ] && ! grep -q "/nhl-auth/establish-session" /etc/nginx/nginx.conf; then
-        # Add the map for session checking
-        sed -i '/scgi_temp_path/a\
-\n    # Redirect to establish-session when hash parameter is present\
-    map $arg_hash $need_session {\
-        default 0;\
-        "~.+" 1;\
-    }' /etc/nginx/nginx.conf
-
-        # Add the establish-session endpoint
-        sed -i '/location \/nhl-auth\/ {/a\
-        location /nhl-auth/establish-session {\
-            proxy_pass http://127.0.0.1:9999/nhl-auth/establish-session;\
-            proxy_http_version 1.1;\
-            proxy_set_header Host $host;\
-            proxy_set_header X-Real-IP $remote_addr;\
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\
-            proxy_set_header Cookie $http_cookie;\
-        }\
-' /etc/nginx/nginx.conf
-
-        # Add the redirect logic in main location
-        sed -i '/AUTH_CHECK_BLOCK_PLACEHOLDER/a\
-            # If hash parameter is present and no session cookie, redirect to establish session first\
-            if ($need_session = 1) {\
-                return 307 /nhl-auth/establish-session?hash=$arg_hash\&return_to=$request_uri;\
-            }' /etc/nginx/nginx.conf
-    fi
-
-
-    echo "Dynamic paths TTL: $DYNAMIC_PATHS_TTL seconds"
+    echo "Hash content paths enabled - paths matching /[a-f0-9]{40}* bypass authentication"
 else
-    echo "No dynamic paths configured"
+    echo "Hash content paths disabled (set ALLOW_HASH_CONTENT_PATHS=true to enable)"
 fi
 
 # Apply authentication block to nginx configuration
