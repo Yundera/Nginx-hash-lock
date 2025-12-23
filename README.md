@@ -613,5 +613,6 @@ The Docker image is automatically built and published to GitHub Container Regist
 
 For manual builds (development only):
 ```bash
-docker build -t ghcr.io/yundera/nginx-hash-lock:dev .
+docker build -t krizcold/nginxhashlock:dev .
+docker push krizcold/nginxhashlock:dev
 ```
