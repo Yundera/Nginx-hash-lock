@@ -2,8 +2,34 @@
 
 echo "Starting nginxhashlock..."
 
-# Copy template to working config
-cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.backup
+# On first run, save the original template
+if [ ! -f /etc/nginx/nginx.conf.template ]; then
+    echo "Saving original nginx.conf as template..."
+    cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.template
+fi
+
+# Always start with a clean copy from template
+echo "Copying clean template to working config..."
+if ! cp /etc/nginx/nginx.conf.template /etc/nginx/nginx.conf; then
+    echo "ERROR: Failed to copy template to working config"
+    exit 1
+fi
+
+# Validate inputs before using in sed replacements
+if ! echo "$BACKEND_HOST" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+    echo "ERROR: Invalid BACKEND_HOST (only alphanumeric, dots, underscores, and hyphens allowed)"
+    exit 1
+fi
+
+if ! echo "$BACKEND_PORT" | grep -qE '^[0-9]+$' || [ "$BACKEND_PORT" -lt 1 ] || [ "$BACKEND_PORT" -gt 65535 ]; then
+    echo "ERROR: Invalid BACKEND_PORT (must be 1-65535)"
+    exit 1
+fi
+
+if ! echo "$LISTEN_PORT" | grep -qE '^[0-9]+$' || [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
+    echo "ERROR: Invalid LISTEN_PORT (must be 1-65535)"
+    exit 1
+fi
 
 # Replace basic placeholders
 sed -i "s/BACKEND_HOST_PLACEHOLDER/$BACKEND_HOST/g" /etc/nginx/nginx.conf
@@ -34,8 +60,37 @@ if [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ]; then
     echo "Auth service started with PID: $AUTH_SERVICE_PID"
     cd /
 
-    # Wait for auth service to be ready
-    sleep 2
+    # Wait for auth service to be ready with timeout
+    echo "Waiting for auth service to be ready..."
+    TIMEOUT=10
+    for i in $(seq 1 $TIMEOUT); do
+        # Try curl first, fall back to nc (netcat) port check
+        if command -v curl > /dev/null 2>&1; then
+            if curl -sf --max-time 2 http://127.0.0.1:9999/health > /dev/null 2>&1; then
+                echo "Auth service is ready"
+                break
+            fi
+        elif command -v nc > /dev/null 2>&1; then
+            if nc -z 127.0.0.1 9999 > /dev/null 2>&1; then
+                echo "Auth service is ready (port check)"
+                break
+            fi
+        else
+            # No curl or nc available, just wait and trust the logs
+            if [ $i -ge 3 ]; then
+                echo "Auth service assumed ready (no health check tools available)"
+                break
+            fi
+        fi
+
+        if [ $i -eq $TIMEOUT ]; then
+            echo "ERROR: Auth service failed to start within ${TIMEOUT}s"
+            echo "Last 20 lines of auth service log:"
+            tail -20 /var/log/auth-service.log
+            exit 1
+        fi
+        sleep 1
+    done
 fi
 
 # Build the authentication check block based on AUTH_MODE
@@ -107,12 +162,12 @@ fi
 # Handle ALLOWED_PATHS
 if [ -n "$ALLOWED_PATHS" ]; then
     echo "Configuring allowed paths: $ALLOWED_PATHS"
-    # Normalize paths: strip leading/trailing slashes from each comma-separated value
+    # Normalize paths: strip leading/trailing slashes and spaces from each comma-separated value
     # This handles: "/guild,/auth" -> "guild,auth"
-    #              "login,/api/health/,/guild" -> "login,api/health,guild"
+    #              "login, /api/health/, /guild" -> "login,api/health,guild"
     #              "page/\",/something/else/" -> "page/\",something/else"
     NORMALIZED_PATHS=$(echo "$ALLOWED_PATHS" | \
-        sed 's/^\/\+//;s/\/\+$//;s/,\/\+/,/g;s/\/\+,/,/g' | \
+        sed 's/^[ \/]\+//;s/[ \/]\+$//;s/[ \/]\+,/,/g;s/,[ \/]\+/,/g' | \
         sed 's/,\+/,/g')
     echo "Normalized paths: $NORMALIZED_PATHS"
     # Convert comma-separated to regex format: login,api/health -> (login|api/health)
