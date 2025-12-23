@@ -2,17 +2,17 @@ name: yunderaterminal
 
 services:
   yunderaterminal:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     container_name: yunderaterminal
     restart: unless-stopped
     expose:
-      - "3000"
+      - 80
     user: "root"
     environment:
       AUTH_HASH: $AUTH_HASH
       BACKEND_HOST: "ttyd"
       BACKEND_PORT: "7681"
-      LISTEN_PORT: "3000"
+      LISTEN_PORT: "80"
       # ALLOWED_EXTENSIONS: "js,css,png,ico,svg"
       # ↑ Uncomment to allow static assets without auth
       # ↑ Not needed for terminal - ttyd serves self-contained HTML
@@ -67,4 +67,4 @@ x-casaos:
   store_app_id: yunderaterminal
   is_uncontrolled: false
   index: /?hash=$AUTH_HASH
-  webui_port: 3000
+  webui_port: 80

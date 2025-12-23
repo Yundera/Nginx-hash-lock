@@ -2,11 +2,11 @@ name: yunderaterminalboth
 
 services:
   yunderaterminalboth:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     container_name: yunderaterminalboth
     restart: unless-stopped
     expose:
-      - "3000"
+      - 80
     user: "root"
     environment:
       # Both authentication methods enabled - accept either!
@@ -16,7 +16,7 @@ services:
       SESSION_DURATION_HOURS: "168"  # 1 week
       BACKEND_HOST: "ttydboth"
       BACKEND_PORT: "7681"
-      LISTEN_PORT: "3000"
+      LISTEN_PORT: "80"
       # ALLOWED_EXTENSIONS: "js,css,png,ico,svg"
       # ↑ Uncomment to allow static assets without auth
       # ALLOWED_PATHS: "api/health"
@@ -70,4 +70,4 @@ x-casaos:
   is_uncontrolled: false
   # Can use hash directly or go to login page
   index: /?hash=$AUTH_HASH
-  webui_port: 3000
+  webui_port: 80

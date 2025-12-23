@@ -21,7 +21,7 @@ NGINX Hash Lock sits in front of your application and provides flexible authenti
 environment:
   BACKEND_HOST: "your-app"               # Required: Backend service hostname
   BACKEND_PORT: "8080"                   # Required: Backend service port
-  LISTEN_PORT: "3000"                    # Required: Port NGINX listens on
+  LISTEN_PORT: "80"                      # Required: Port NGINX listens on (80 recommended for clean subdomains)
 ```
 
 **Authentication Options:**
@@ -84,14 +84,14 @@ This ensures the Dashboard button automatically includes the authentication hash
 ```yaml
 services:
   hashlock:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     environment:
       AUTH_HASH: $AUTH_HASH            # CasaOS provides this
       BACKEND_HOST: "myapp"
       BACKEND_PORT: "8080"
-      LISTEN_PORT: "3000"
-    ports:
-      - "3000:3000"
+      LISTEN_PORT: "80"
+    expose:
+      - 80
     depends_on:
       - myapp
 
@@ -101,7 +101,7 @@ services:
 x-casaos:
   main: hashlock
   index: /?hash=$AUTH_HASH             # IMPORTANT: Include hash in URL
-  webui_port: 3000
+  webui_port: 80
 ```
 
 **CasaOS Dashboard button:** Automatically opens with authentication hash
@@ -111,16 +111,16 @@ x-casaos:
 ```yaml
 services:
   hashlock:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     environment:
       USER: $USER                      # Set in CasaOS or compose
       PASSWORD: $PASSWORD              # Set in CasaOS or compose
       SESSION_DURATION_HOURS: "168"    # 1 week
       BACKEND_HOST: "myapp"
       BACKEND_PORT: "8080"
-      LISTEN_PORT: "3000"
-    ports:
-      - "3000:3000"
+      LISTEN_PORT: "80"
+    expose:
+      - 80
     depends_on:
       - myapp
 
@@ -130,7 +130,7 @@ services:
 x-casaos:
   main: hashlock
   index: /                             # No hash needed - shows login page
-  webui_port: 3000
+  webui_port: 80
 ```
 
 **CasaOS Dashboard button:** Opens login page → Enter credentials → 1-week session
@@ -140,7 +140,7 @@ x-casaos:
 ```yaml
 services:
   hashlock:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     environment:
       AUTH_HASH: $AUTH_HASH            # Option 1: CasaOS hash
       USER: $USER                      # Option 2: Password auth
@@ -148,9 +148,9 @@ services:
       SESSION_DURATION_HOURS: "720"    # 30 days
       BACKEND_HOST: "myapp"
       BACKEND_PORT: "8080"
-      LISTEN_PORT: "3000"
-    ports:
-      - "3000:3000"
+      LISTEN_PORT: "80"
+    expose:
+      - 80
     depends_on:
       - myapp
 
@@ -160,7 +160,7 @@ services:
 x-casaos:
   main: hashlock
   index: /?hash=$AUTH_HASH             # Dashboard uses hash (quick access)
-  webui_port: 3000
+  webui_port: 80
 ```
 
 **CasaOS Dashboard button:** Opens with hash (quick access)
@@ -169,7 +169,7 @@ x-casaos:
 ## How It Works
 
 ### Hash Authentication Mode
-1. **With correct hash**: `http://yourserver:3000/?hash=my-secret-123` → Access granted
+1. **With correct hash**: `https://yourapp.example.com/?hash=my-secret-123` → Access granted
 2. **Without hash**: Returns 403 Forbidden with custom error page
 
 ### Username/Password Mode
@@ -256,7 +256,7 @@ volumes:
 
 services:
   authproxy:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     volumes:
       - dynamic_paths:/tmp/dynamic_paths
     environment:
@@ -274,12 +274,12 @@ services:
 services:
   # Authentication proxy with dynamic allowlisting
   streamauth:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     environment:
       AUTH_HASH: $AUTH_HASH
       BACKEND_HOST: "streamer"
       BACKEND_PORT: "8080"
-      LISTEN_PORT: "3000"
+      LISTEN_PORT: "80"
       # Enable dynamic allowlisting for media files
       DYNAMIC_PATHS_FILE: "/tmp/dynamic_paths/allowed.txt"
       DYNAMIC_PATHS_TTL: "600"  # 10 minutes for video streaming
@@ -288,8 +288,8 @@ services:
       ALLOWED_PATHS: "api/status,health"
     volumes:
       - media_allowlist:/tmp/dynamic_paths
-    ports:
-      - "3000:3000"
+    expose:
+      - 80
 
   # Media server (e.g., Stremio, Jellyfin, Plex)
   streamer:
@@ -393,12 +393,14 @@ Quick access via URL hash parameter - Dashboard button includes hash automatical
 ```yaml
 services:
   yunderaterminal:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     environment:
       AUTH_HASH: $AUTH_HASH            # CasaOS provides this
       BACKEND_HOST: "ttyd"
       BACKEND_PORT: "7681"
-      LISTEN_PORT: "3000"
+      LISTEN_PORT: "80"
+    expose:
+      - 80
     depends_on:
       - ttyd
 
@@ -409,7 +411,7 @@ services:
 x-casaos:
   main: yunderaterminal
   index: /?hash=$AUTH_HASH             # IMPORTANT: Pass hash to URL
-  webui_port: 3000
+  webui_port: 80
 ```
 
 **CasaOS Dashboard:** Automatically opens with hash → Instant access
@@ -420,14 +422,16 @@ Session-based login with username/password:
 ```yaml
 services:
   yunderaterminalpass:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     environment:
       USER: $USER                      # Set in CasaOS
       PASSWORD: $PASSWORD              # Set in CasaOS
       SESSION_DURATION_HOURS: "720"    # 30 days
       BACKEND_HOST: "ttydpass"
       BACKEND_PORT: "7681"
-      LISTEN_PORT: "3000"
+      LISTEN_PORT: "80"
+    expose:
+      - 80
     depends_on:
       - ttydpass
 
@@ -438,7 +442,7 @@ services:
 x-casaos:
   main: yunderaterminalpass
   index: /                             # No hash - show login page
-  webui_port: 3000
+  webui_port: 80
 ```
 
 **CasaOS Dashboard:** Opens login page → Enter credentials → 30-day session
@@ -449,7 +453,7 @@ Accept BOTH hash OR password for maximum flexibility:
 ```yaml
 services:
   yunderaterminalboth:
-    image: krizcold/nginxhashlock:latest
+    image: ghcr.io/yundera/nginx-hash-lock:latest
     environment:
       AUTH_HASH: $AUTH_HASH            # Option 1: CasaOS hash (Dashboard)
       USER: $USER                      # Option 2: Login page
@@ -457,7 +461,9 @@ services:
       SESSION_DURATION_HOURS: "168"    # 1 week
       BACKEND_HOST: "ttydboth"
       BACKEND_PORT: "7681"
-      LISTEN_PORT: "3000"
+      LISTEN_PORT: "80"
+    expose:
+      - 80
     depends_on:
       - ttydboth
 
@@ -468,7 +474,7 @@ services:
 x-casaos:
   main: yunderaterminalboth
   index: /?hash=$AUTH_HASH             # Dashboard uses hash for quick access
-  webui_port: 3000
+  webui_port: 80
 ```
 
 **CasaOS Dashboard:** Opens with hash → Instant access
@@ -599,9 +605,13 @@ The dynamic allowlist feature is particularly useful for:
 - Download managers with web interfaces
 - Any app where backend services need temporary resource access
 
-## Quick note to update source code:
+## Building & Publishing
 
+The Docker image is automatically built and published to GitHub Container Registry via GitHub Actions on every push to `main`.
+
+**Image location:** `ghcr.io/yundera/nginx-hash-lock:latest`
+
+For manual builds (development only):
 ```bash
-docker build -t krizcold/nginxhashlock:latest .
-docker push krizcold/nginxhashlock:latest
+docker build -t ghcr.io/yundera/nginx-hash-lock:dev .
 ```
