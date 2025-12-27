@@ -71,6 +71,35 @@ x-casaos:
 
 This ensures the Dashboard button automatically includes the authentication hash.
 
+### Critical: Container Naming for Subdomain Routing
+
+**The NGINX Hash Lock container MUST have the same name as the app.** The mesh-router routes subdomains based on container name matching the app name in `docker-compose.yml`.
+
+**Correct Setup:**
+```yaml
+name: myapp                          # App name
+
+services:
+  myapp:                             # ← Service name matches app name
+    image: ghcr.io/yundera/nginx-hash-lock:latest
+    container_name: myapp            # ← Container name matches app name
+    environment:
+      BACKEND_HOST: "myapp-backend"  # ← Points to backend
+      ...
+
+  myapp-backend:                     # ← Backend has different name
+    image: your-actual-app:latest
+    container_name: myapp-backend
+
+x-casaos:
+  main: myapp                        # ← Main service is the nginx proxy
+```
+
+**Why this matters:**
+- Subdomain `myapp-username.nsl.sh` routes to container named `myapp`
+- If the backend has the app name, traffic bypasses NGINX Hash Lock entirely
+- The nginx proxy must "claim" the app name for proper routing
+
 ## Docker Compose Examples
 
 ### Example 1: Hash-Only Authentication (CasaOS)
@@ -391,9 +420,10 @@ No manual configuration needed - just set environment variables and run.
 
 | Configuration | Auth Service (port 9999) | NGINX |
 |--------------|--------------------------|-------|
-| Hash only | ❌ | ✅ |
+| Hash only | ✅ | ✅ |
 | Credentials only | ✅ | ✅ |
 | Both methods | ✅ | ✅ |
+| No authentication | ❌ | ✅ |
 
 ## Technical Architecture
 
@@ -401,7 +431,11 @@ No manual configuration needed - just set environment variables and run.
 
 **Hash-Only Mode:**
 ```
-Request → NGINX checks ?hash parameter → Grant/Deny → Backend/403
+Request → NGINX auth_request to auth service → Check session cookie
+  ├─ Valid session → Backend
+  └─ No/invalid session → Check ?hash parameter
+      ├─ Valid hash → Create session cookie → Backend
+      └─ Invalid/missing → Return 403 Forbidden
 ```
 
 **Credentials-Only Mode:**
