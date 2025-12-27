@@ -50,8 +50,8 @@ echo "========================================="
 echo "Authentication Mode: $AUTH_MODE"
 echo "========================================="
 
-# Start auth service if credentials are configured
-if [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ]; then
+# Start auth service if any authentication is configured (for session management)
+if [ "$AUTH_MODE" = "hash_only" ] || [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ]; then
     echo "Starting authentication service..."
     export SESSION_DURATION_HOURS="${SESSION_DURATION_HOURS:-720}"
     cd /app/auth-service
@@ -103,11 +103,19 @@ case "$AUTH_MODE" in
         ;;
 
     "hash_only")
-        echo "Hash-only authentication configured"
-        AUTH_CHECK_BLOCK="            # Hash-only authentication
-            if (\$arg_hash != \"$AUTH_HASH\") {
-                return 403;
-            }"
+        echo "Hash-only authentication configured (with session support)"
+        AUTH_CHECK_BLOCK="            # Hash-only authentication with session
+            auth_request /internal-auth-check;
+            auth_request_set \$auth_cookie \$upstream_http_set_cookie;
+            add_header Set-Cookie \$auth_cookie;
+            error_page 401 = @auth_failed_403;"
+
+        # Add named location for auth failure handling (returns 403, no login page)
+        sed -i 's|location / {|location @auth_failed_403 {\
+            return 403;\
+        }\
+\
+        location / {|' /etc/nginx/nginx.conf
         ;;
 
     "credentials_only")
@@ -196,7 +204,8 @@ if [ "$ALLOW_HASH_CONTENT_PATHS" = "true" ] || [ "$ALLOW_HASH_CONTENT_PATHS" = "
         # Allow 40-character hex content paths without authentication
         # Used by Stremio and similar apps where the hash itself is the access token
         location ~ "^/[a-f0-9]{40}" {
-            proxy_pass http://$BACKEND_HOST:$BACKEND_PORT;
+            set \$backend_upstream "$BACKEND_HOST:$BACKEND_PORT";
+            proxy_pass http://\$backend_upstream;
             proxy_http_version 1.1;
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
@@ -224,6 +233,20 @@ echo "Final nginx configuration:"
 echo "========================================="
 cat /etc/nginx/nginx.conf
 echo "========================================="
+
+# Wait for backend DNS to be resolvable before starting nginx
+echo "Waiting for backend DNS resolution ($BACKEND_HOST)..."
+DNS_TIMEOUT=30
+for i in $(seq 1 $DNS_TIMEOUT); do
+    if getent hosts "$BACKEND_HOST" > /dev/null 2>&1; then
+        echo "Backend DNS resolved: $BACKEND_HOST -> $(getent hosts "$BACKEND_HOST" | awk '{print $1}')"
+        break
+    fi
+    if [ $i -eq $DNS_TIMEOUT ]; then
+        echo "WARNING: Backend DNS resolution timeout after ${DNS_TIMEOUT}s, starting anyway..."
+    fi
+    sleep 1
+done
 
 # Start nginx
 echo "Starting nginx..."
