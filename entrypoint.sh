@@ -36,6 +36,32 @@ sed -i "s/BACKEND_HOST_PLACEHOLDER/$BACKEND_HOST/g" /etc/nginx/nginx.conf
 sed -i "s/BACKEND_PORT_PLACEHOLDER/$BACKEND_PORT/g" /etc/nginx/nginx.conf
 sed -i "s/LISTEN_PORT_PLACEHOLDER/$LISTEN_PORT/g" /etc/nginx/nginx.conf
 
+# These defaults prioritize compatibility over performance
+PROXY_BUFFERING="${PROXY_BUFFERING:-off}"
+PROXY_REQUEST_BUFFERING="${PROXY_REQUEST_BUFFERING:-off}"
+PROXY_CONNECT_TIMEOUT="${PROXY_CONNECT_TIMEOUT:-300s}"
+PROXY_SEND_TIMEOUT="${PROXY_SEND_TIMEOUT:-300s}"
+PROXY_READ_TIMEOUT="${PROXY_READ_TIMEOUT:-300s}"
+CLIENT_MAX_BODY_SIZE="${CLIENT_MAX_BODY_SIZE:-0}"
+
+echo "========================================="
+echo "Proxy Configuration:"
+echo "  PROXY_BUFFERING: $PROXY_BUFFERING"
+echo "  PROXY_REQUEST_BUFFERING: $PROXY_REQUEST_BUFFERING"
+echo "  PROXY_CONNECT_TIMEOUT: $PROXY_CONNECT_TIMEOUT"
+echo "  PROXY_SEND_TIMEOUT: $PROXY_SEND_TIMEOUT"
+echo "  PROXY_READ_TIMEOUT: $PROXY_READ_TIMEOUT"
+echo "  CLIENT_MAX_BODY_SIZE: $CLIENT_MAX_BODY_SIZE"
+echo "========================================="
+
+# Replace proxy behavior placeholders
+sed -i "s/PROXY_BUFFERING_PLACEHOLDER/$PROXY_BUFFERING/g" /etc/nginx/nginx.conf
+sed -i "s/PROXY_REQUEST_BUFFERING_PLACEHOLDER/$PROXY_REQUEST_BUFFERING/g" /etc/nginx/nginx.conf
+sed -i "s/PROXY_CONNECT_TIMEOUT_PLACEHOLDER/$PROXY_CONNECT_TIMEOUT/g" /etc/nginx/nginx.conf
+sed -i "s/PROXY_SEND_TIMEOUT_PLACEHOLDER/$PROXY_SEND_TIMEOUT/g" /etc/nginx/nginx.conf
+sed -i "s/PROXY_READ_TIMEOUT_PLACEHOLDER/$PROXY_READ_TIMEOUT/g" /etc/nginx/nginx.conf
+sed -i "s/CLIENT_MAX_BODY_SIZE_PLACEHOLDER/$CLIENT_MAX_BODY_SIZE/g" /etc/nginx/nginx.conf
+
 # Determine authentication mode
 AUTH_MODE="none"
 if [ -n "$AUTH_HASH" ] && [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
@@ -207,11 +233,18 @@ if [ "$ALLOW_HASH_CONTENT_PATHS" = "true" ] || [ "$ALLOW_HASH_CONTENT_PATHS" = "
             set \$backend_upstream "$BACKEND_HOST:$BACKEND_PORT";
             proxy_pass http://\$backend_upstream;
             proxy_http_version 1.1;
+
+            # === Standard proxy headers ===
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+            proxy_set_header X-Forwarded-Host \$host;
+            proxy_set_header X-Forwarded-Port \$server_port;
+
+            # === WebSocket support (uses map for correct behavior) ===
             proxy_set_header Upgrade \$http_upgrade;
-            proxy_set_header Connection "upgrade";
+            proxy_set_header Connection \$connection_upgrade;
         }
 EOF
 

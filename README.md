@@ -42,6 +42,17 @@ environment:
   ALLOW_HASH_CONTENT_PATHS: "true"       # Optional: Allow /[40-hex-char]/* paths without auth (for Stremio, etc.)
 ```
 
+**Proxy Behavior (Advanced):**
+```yaml
+  # These have sensible defaults - only override if needed
+  PROXY_BUFFERING: "off"                 # Default: off. Use "on" for caching/rate-limiting support
+  PROXY_REQUEST_BUFFERING: "off"         # Default: off. Use "on" if backend needs full body before processing
+  PROXY_CONNECT_TIMEOUT: "300s"          # Default: 300s. Time to establish backend connection
+  PROXY_SEND_TIMEOUT: "300s"             # Default: 300s. Timeout between write operations to backend
+  PROXY_READ_TIMEOUT: "300s"             # Default: 300s. Timeout between read operations from backend
+  CLIENT_MAX_BODY_SIZE: "0"              # Default: 0 (unlimited). Use "10G" or "100M" to limit uploads
+```
+
 ## Authentication Modes
 
 The system automatically selects the authentication mode based on which environment variables are configured:
@@ -482,6 +493,73 @@ The `ALLOW_HASH_CONTENT_PATHS` feature is useful for:
 - Media servers that use 40-character hex paths for content
 - Applications where the content hash acts as an access token
 - Stremio and similar streaming applications
+
+### Supported Features
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Standard HTTP/1.1 apps | ✅ | Fully supported |
+| WebSocket connections | ✅ | Automatic detection and upgrade |
+| Video/audio streaming | ✅ | Buffering disabled by default |
+| Large file uploads | ✅ | Unlimited by default |
+| Server-Sent Events (SSE) | ✅ | Proper headers configured |
+| Long-polling requests | ✅ | 5-minute timeouts |
+| REST APIs | ✅ | All methods supported |
+
+### Known Limitations
+
+| Feature | Status | Reason |
+|---------|--------|--------|
+| gRPC | ❌ | Requires `grpc_pass` directive and HTTP/2 - fundamentally different from HTTP proxying |
+| HTTP/2 to backend | ❌ | Uses HTTP/1.1 for backend connections (sufficient for 99% of apps) |
+| Headers with underscores | ⚠️ | Ignored by default (nginx default behavior) |
+
+**Note on gRPC:** Applications using gRPC (some CI/CD tools, Kubernetes services) cannot be proxied through NGINX Hash Lock. gRPC requires a completely different nginx configuration using `grpc_pass` instead of `proxy_pass`.
+
+## Proxy Behavior Configuration
+
+NGINX Hash Lock is designed to work with **any application** out of the box. The defaults prioritize compatibility over performance.
+
+### Environment Variables Reference
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_BUFFERING` | `off` | Response buffering. `off` = streaming-friendly, `on` = better for caching |
+| `PROXY_REQUEST_BUFFERING` | `off` | Request buffering. `off` = large uploads work, `on` = backend gets full body first |
+| `PROXY_CONNECT_TIMEOUT` | `300s` | Time allowed to establish connection with backend |
+| `PROXY_SEND_TIMEOUT` | `300s` | Timeout between successive write operations to backend |
+| `PROXY_READ_TIMEOUT` | `300s` | Timeout between successive read operations from backend |
+| `CLIENT_MAX_BODY_SIZE` | `0` | Maximum upload size. `0` = unlimited, or use `10G`, `100M`, etc. |
+
+### When to Override Defaults
+
+**Most apps need no configuration** - the defaults handle:
+- Video/audio streaming (Stremio, Jellyfin, Plex)
+- Large file uploads (ConvertX, file managers)
+- WebSocket connections (terminals, real-time apps)
+- Server-Sent Events (SSE)
+- Long-polling requests
+
+**Override only if:**
+
+| Scenario | Setting |
+|----------|---------|
+| Need nginx-level caching | `PROXY_BUFFERING=on` |
+| Need nginx rate-limiting | `PROXY_BUFFERING=on` |
+| Backend requires full request before processing | `PROXY_REQUEST_BUFFERING=on` |
+| Want to limit upload sizes | `CLIENT_MAX_BODY_SIZE=10G` |
+| Very long operations (>5 min) | `PROXY_READ_TIMEOUT=3600s` |
+
+### What's Fixed Automatically
+
+These issues are handled without configuration:
+
+| Feature | Implementation |
+|---------|----------------|
+| WebSocket support | Correct `Connection` header via nginx `map` directive |
+| Forwarded headers | `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Port` |
+| SSE support | `X-Accel-Buffering: no` header |
+| Backend redirects | Proper redirect rewriting |
 
 ## Building & Publishing
 
