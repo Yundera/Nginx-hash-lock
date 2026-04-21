@@ -3,6 +3,7 @@ const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { Issuer, generators } = require('openid-client');
 
 const app = express();
 const PORT = 9999;
@@ -13,15 +14,25 @@ const PASSWORD = process.env.PASSWORD || '';
 const AUTH_HASH = process.env.AUTH_HASH || '';
 const SESSION_DURATION_HOURS = parseInt(process.env.SESSION_DURATION_HOURS || '720', 10);
 const SESSION_DURATION_MS = SESSION_DURATION_HOURS * 60 * 60 * 1000;
+const OIDC_ENABLED = process.env.AUTH_OIDC === 'true' || process.env.AUTH_OIDC === '1';
+const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || 'http://authelia-registrar:9092').replace(/\/+$/, '');
 
 // Generate password hash for session validation
 // When password changes (container restart), password-based sessions become invalid
 const PASSWORD_HASH = crypto.createHash('sha256').update(PASSWORD + USERNAME).digest('hex');
 
 // In-memory session store
-// Format: { sessionId: { expires: timestamp, passwordHash?: string, authHash?: string } }
-// Sessions can be authenticated via password OR auth hash
+// Format: { sessionId: { expires: timestamp, passwordHash?: string, authHash?: string, oidcSub?: string } }
 const sessions = {};
+
+// OIDC state: the client is lazy-initialized on the first /oidc/login request, because we
+// need the public Host header to compute the redirect URI before calling the registrar.
+let oidcClient = null;
+let oidcIssuerUrl = null;
+
+// Pending authorization-code flows keyed by OAuth `state`: { codeVerifier, originalUri, createdAt }
+const pendingOidcFlows = new Map();
+const OIDC_FLOW_TTL_MS = 10 * 60 * 1000;
 
 // Generate secure random session ID
 function generateSessionId() {
@@ -42,6 +53,60 @@ setInterval(() => {
         console.log(`[Auth Service] Cleaned up ${cleaned} expired sessions`);
     }
 }, 60 * 60 * 1000);
+
+// Cleanup stale pending OIDC flows every 5 minutes
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [state, flow] of pendingOidcFlows) {
+        if (now - flow.createdAt > OIDC_FLOW_TTL_MS) {
+            pendingOidcFlows.delete(state);
+            cleaned++;
+        }
+    }
+    if (cleaned > 0) {
+        console.log(`[Auth Service] Cleaned up ${cleaned} stale OIDC flows`);
+    }
+}, 5 * 60 * 1000);
+
+function getPublicOrigin(req) {
+    const proto = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers['x-forwarded-host'] || req.headers['host'];
+    if (!host) {
+        throw new Error('Cannot determine public origin: no Host header');
+    }
+    return `${proto}://${host}`;
+}
+
+async function getOrInitOidcClient(publicOrigin) {
+    if (oidcClient) return oidcClient;
+
+    const callbackUrl = `${publicOrigin}/nhl-auth/oidc/callback`;
+    console.log(`[Auth Service] Registering OIDC client with ${OIDC_REGISTRAR_URL} (callback=${callbackUrl})`);
+
+    const response = await fetch(`${OIDC_REGISTRAR_URL}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ redirect_uris: [callbackUrl] }),
+    });
+    if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Registrar returned ${response.status}: ${body}`);
+    }
+    const { client_id, client_secret, issuer_url } = await response.json();
+    console.log(`[Auth Service] Registered OIDC client_id=${client_id} issuer=${issuer_url}`);
+
+    const issuer = await Issuer.discover(issuer_url);
+    oidcClient = new issuer.Client({
+        client_id,
+        client_secret,
+        redirect_uris: [callbackUrl],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'client_secret_basic',
+    });
+    oidcIssuerUrl = issuer_url;
+    return oidcClient;
+}
 
 // Middleware
 app.use(express.json());
@@ -219,11 +284,13 @@ app.get('/nhl-auth/check', (req, res) => {
         }
         // Check if credentials are still valid
         else {
-            // Session is valid if EITHER password hash OR auth hash matches
+            // Session is valid if ANY of: password hash, auth hash, or OIDC sub is set.
+            // OIDC sessions are trusted until expiry — there's no local credential to re-verify.
             const passwordValid = session.passwordHash && session.passwordHash === PASSWORD_HASH;
             const authHashValid = session.authHash && session.authHash === AUTH_HASH;
+            const oidcValid = !!session.oidcSub;
 
-            if (passwordValid || authHashValid) {
+            if (passwordValid || authHashValid || oidcValid) {
                 console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...)`);
                 return res.status(200).send('OK');
             } else {
@@ -361,6 +428,95 @@ app.get('/nhl-auth/establish-session', (req, res) => {
     return res.status(401).json({ status: 'error', message: 'Invalid or missing hash' });
 });
 
+// Start OIDC authorization_code + PKCE flow
+app.get('/nhl-auth/oidc/login', async (req, res) => {
+    if (!OIDC_ENABLED) {
+        return res.status(404).send('OIDC authentication not enabled');
+    }
+    try {
+        const publicOrigin = getPublicOrigin(req);
+        const client = await getOrInitOidcClient(publicOrigin);
+
+        const codeVerifier = generators.codeVerifier();
+        const codeChallenge = generators.codeChallenge(codeVerifier);
+        const state = generators.state();
+
+        // Constrain the post-login redirect to our own origin. An attacker-controlled
+        // redirect= param would otherwise turn this endpoint into an open redirector
+        // after a successful login.
+        let originalUri = '/';
+        const redirectParam = typeof req.query.redirect === 'string' ? req.query.redirect : '';
+        if (redirectParam) {
+            try {
+                const parsed = new URL(redirectParam, publicOrigin);
+                if (parsed.origin === publicOrigin) {
+                    originalUri = parsed.pathname + parsed.search + parsed.hash;
+                }
+            } catch {
+                originalUri = '/';
+            }
+        }
+
+        pendingOidcFlows.set(state, { codeVerifier, originalUri, createdAt: Date.now() });
+
+        const authUrl = client.authorizationUrl({
+            scope: 'openid profile email groups',
+            state,
+            code_challenge: codeChallenge,
+            code_challenge_method: 'S256',
+        });
+        console.log(`[Auth Service] OIDC login: state=${state.substring(0, 8)}... target=${originalUri}`);
+        res.redirect(authUrl);
+    } catch (err) {
+        console.error('[Auth Service] OIDC login failed:', err);
+        res.status(500).send('OIDC login failed: ' + err.message);
+    }
+});
+
+// Exchange authorization code for tokens and mint a session cookie
+app.get('/nhl-auth/oidc/callback', async (req, res) => {
+    if (!OIDC_ENABLED) {
+        return res.status(404).send('OIDC authentication not enabled');
+    }
+    try {
+        const publicOrigin = getPublicOrigin(req);
+        const client = await getOrInitOidcClient(publicOrigin);
+
+        const params = client.callbackParams(req);
+        if (!params.state || !pendingOidcFlows.has(params.state)) {
+            console.warn(`[Auth Service] OIDC callback rejected: unknown state=${params.state}`);
+            return res.status(400).send('Invalid or expired OIDC state');
+        }
+        const flow = pendingOidcFlows.get(params.state);
+        pendingOidcFlows.delete(params.state);
+
+        const tokenSet = await client.callback(
+            `${publicOrigin}/nhl-auth/oidc/callback`,
+            params,
+            { state: params.state, code_verifier: flow.codeVerifier },
+        );
+        const claims = tokenSet.claims();
+
+        const sessionId = generateSessionId();
+        sessions[sessionId] = {
+            expires: Date.now() + SESSION_DURATION_MS,
+            oidcSub: claims.sub,
+        };
+        console.log(`[Auth Service] OIDC session created for sub=${claims.sub} (${sessionId.substring(0, 8)}...)`);
+
+        res.cookie('nginxhashlock_session', sessionId, {
+            httpOnly: true,
+            secure: false,
+            maxAge: SESSION_DURATION_MS,
+            sameSite: 'lax',
+        });
+        res.redirect(flow.originalUri || '/');
+    } catch (err) {
+        console.error('[Auth Service] OIDC callback failed:', err);
+        res.status(500).send('OIDC callback failed: ' + err.message);
+    }
+});
+
 // Health check
 app.get('/health', (req, res) => {
     res.status(200).json({
@@ -377,6 +533,7 @@ app.listen(PORT, () => {
     console.log(`[Auth Service] Listening on port ${PORT}`);
     console.log(`[Auth Service] Username configured: ${USERNAME ? 'Yes' : 'No'}`);
     console.log(`[Auth Service] Password configured: ${PASSWORD ? 'Yes' : 'No'}`);
+    console.log(`[Auth Service] OIDC enabled: ${OIDC_ENABLED ? `Yes (registrar=${OIDC_REGISTRAR_URL})` : 'No'}`);
     console.log(`[Auth Service] Session duration: ${SESSION_DURATION_HOURS} hours`);
     console.log('=====================================');
 });

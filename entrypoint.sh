@@ -63,8 +63,11 @@ sed -i "s/PROXY_READ_TIMEOUT_PLACEHOLDER/$PROXY_READ_TIMEOUT/g" /etc/nginx/nginx
 sed -i "s/CLIENT_MAX_BODY_SIZE_PLACEHOLDER/$CLIENT_MAX_BODY_SIZE/g" /etc/nginx/nginx.conf
 
 # Determine authentication mode
+# OIDC takes precedence when enabled — mixing with hash/credentials isn't supported yet.
 AUTH_MODE="none"
-if [ -n "$AUTH_HASH" ] && [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
+if [ "$AUTH_OIDC" = "true" ] || [ "$AUTH_OIDC" = "1" ]; then
+    AUTH_MODE="oidc_only"
+elif [ -n "$AUTH_HASH" ] && [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
     AUTH_MODE="both"
 elif [ -n "$AUTH_HASH" ]; then
     AUTH_MODE="hash_only"
@@ -77,7 +80,7 @@ echo "Authentication Mode: $AUTH_MODE"
 echo "========================================="
 
 # Start auth service if any authentication is configured (for session management)
-if [ "$AUTH_MODE" = "hash_only" ] || [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ]; then
+if [ "$AUTH_MODE" = "hash_only" ] || [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ] || [ "$AUTH_MODE" = "oidc_only" ]; then
     echo "Starting authentication service..."
     export SESSION_DURATION_HOURS="${SESSION_DURATION_HOURS:-720}"
     cd /app/auth-service
@@ -172,6 +175,23 @@ case "$AUTH_MODE" in
         # Auth service handles hash checking internally
         sed -i 's|location / {|location @auth_failed_login {\
             return 302 /login?redirect=$request_uri;\
+        }\
+\
+        location / {|' /etc/nginx/nginx.conf
+        ;;
+
+    "oidc_only")
+        echo "OIDC authentication configured (registrar=${OIDC_REGISTRAR_URL:-http://authelia-registrar:9092})"
+        AUTH_CHECK_BLOCK="            # OIDC authentication — auth service validates the session cookie;
+            # on 401 the browser is redirected to the auth service's /nhl-auth/oidc/login
+            # endpoint, which kicks off the authorization_code flow against Authelia.
+            auth_request /internal-auth-check;
+            auth_request_set \$auth_cookie \$upstream_http_set_cookie;
+            add_header Set-Cookie \$auth_cookie;
+            error_page 401 = @auth_failed_oidc;"
+
+        sed -i 's|location / {|location @auth_failed_oidc {\
+            return 302 /nhl-auth/oidc/login?redirect=$request_uri;\
         }\
 \
         location / {|' /etc/nginx/nginx.conf
