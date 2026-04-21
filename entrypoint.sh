@@ -64,8 +64,10 @@ sed -i "s/CLIENT_MAX_BODY_SIZE_PLACEHOLDER/$CLIENT_MAX_BODY_SIZE/g" /etc/nginx/n
 
 # Determine authentication mode
 # OIDC takes precedence when enabled — mixing with hash/credentials isn't supported yet.
+# OIDC is considered enabled iff OIDC_REGISTRAR_URL is set (points at the registrar
+# on the pcs network, typically http://auth-registrar:9092).
 AUTH_MODE="none"
-if [ "$AUTH_OIDC" = "true" ] || [ "$AUTH_OIDC" = "1" ]; then
+if [ -n "$OIDC_REGISTRAR_URL" ]; then
     AUTH_MODE="oidc_only"
 elif [ -n "$AUTH_HASH" ] && [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
     AUTH_MODE="both"
@@ -181,7 +183,7 @@ case "$AUTH_MODE" in
         ;;
 
     "oidc_only")
-        echo "OIDC authentication configured (registrar=${OIDC_REGISTRAR_URL:-http://authelia-registrar:9092})"
+        echo "OIDC authentication configured (registrar=$OIDC_REGISTRAR_URL)"
         AUTH_CHECK_BLOCK="            # OIDC authentication — auth service validates the session cookie;
             # on 401 the browser is redirected to the auth service's /nhl-auth/oidc/login
             # endpoint, which kicks off the authorization_code flow against Authelia.

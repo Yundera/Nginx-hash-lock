@@ -14,8 +14,10 @@ const PASSWORD = process.env.PASSWORD || '';
 const AUTH_HASH = process.env.AUTH_HASH || '';
 const SESSION_DURATION_HOURS = parseInt(process.env.SESSION_DURATION_HOURS || '720', 10);
 const SESSION_DURATION_MS = SESSION_DURATION_HOURS * 60 * 60 * 1000;
-const OIDC_ENABLED = process.env.AUTH_OIDC === 'true' || process.env.AUTH_OIDC === '1';
-const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || 'http://authelia-registrar:9092').replace(/\/+$/, '');
+// OIDC mode is enabled whenever OIDC_REGISTRAR_URL is set — no separate toggle.
+// The registrar must be reachable on the `pcs` docker network (e.g. http://auth-registrar:9092).
+const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || '').replace(/\/+$/, '');
+const OIDC_ENABLED = OIDC_REGISTRAR_URL.length > 0;
 
 // Generate password hash for session validation
 // When password changes (container restart), password-based sessions become invalid

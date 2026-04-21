@@ -8,7 +8,7 @@ This document describes how `nginx-hash-lock` integrates with Yundera's Authelia
 |---|---|---|---|
 | **mesh-router-caddy** | mesh-router-root | Edge TLS termination, subdomain → container routing via labels | Public (`:80`, `:443`) |
 | **authelia** | — (upstream image `authelia/authelia:4.39`) | OIDC provider, user login, session management | Public via `auth-${DOMAIN}` (Caddy-routed) |
-| **authelia-registrar** | mesh-router-root/mesh-router-auth | Auto-registers OIDC clients for apps; derives `client_id` from caller's container name via PTR | **Internal only** (`pcs` network, `:9092`) |
+| **auth-registrar** | mesh-router-root/mesh-router-auth | Auto-registers OIDC clients for apps; derives `client_id` from caller's container name via PTR | **Internal only** (`pcs` network, `:9092`) |
 | **nginx-hash-lock** (this repo) | Nginx-hash-lock | Per-app authentication sidecar. Terminates OIDC flow, manages session cookies, proxies to the real backend | Public via `<app>-<user>.${DOMAIN}` (Caddy-routed) |
 | **app backend** | *(each app)* | The actual service being protected (ttyd, Jellyfin, etc.) | Internal (reached only via hash-lock) |
 
@@ -31,7 +31,7 @@ flowchart TB
             subgraph IdP["Authelia stack (template-root)"]
                 direction LR
                 Authelia["<b>authelia</b><br/>OIDC provider<br/>:9091"]
-                Registrar["<b>authelia-registrar</b><br/>client registration<br/>:9092 (internal only)"]
+                Registrar["<b>auth-registrar</b><br/>client registration<br/>:9092 (internal only)"]
             end
 
             subgraph AppStack["App stack (per-app compose)"]
@@ -67,7 +67,7 @@ flowchart TB
     class Scripts,AuthData,Sock file
 ```
 
-**Key point:** `authelia-registrar` is the only service that touches both the host Docker socket and `authelia`'s config files — it's a concentrated-trust component. Every other hash-lock sidecar stays unprivileged.
+**Key point:** `auth-registrar` is the only service that touches both the host Docker socket and `authelia`'s config files — it's a concentrated-trust component. Every other hash-lock sidecar stays unprivileged.
 
 ## Data flow: first user hit on a protected path
 
@@ -79,7 +79,7 @@ sequenceDiagram
     participant U as Browser
     participant N as nginx (hash-lock)
     participant A as auth-service :9999
-    participant R as authelia-registrar :9092
+    participant R as auth-registrar :9092
     participant Z as authelia
 
     U->>N: GET https://myapp-alice.nsl.sh/
@@ -135,8 +135,8 @@ sequenceDiagram
 
 1. **Public edge** — Caddy handles TLS and routes by subdomain. Anything inside `pcs` trusts that `X-Forwarded-Host` came from Caddy; if Caddy is ever bypassed, the redirect URI validation downstream becomes the only defense.
 2. **pcs network, public services** — Authelia and every hash-lock sidecar. Mutually reachable. An app-level RCE can reach them, so they assume hostile peers on the network (hence the PTR-based attestation on the registrar rather than "trust any caller on pcs").
-3. **pcs network, private services** — `authelia-registrar` and app backends. Not Caddy-labelled; not reachable from outside pcs. Backends are additionally firewalled behind their hash-lock sidecar at the routing layer (Caddy only labels the sidecar's container name, not the backend's).
-4. **Host** — the `authelia-registrar` container mounts the Docker socket and `/DATA/AppData/yundera/auth`. This is the concentrated-risk surface: one audited container can invoke `docker run` and write Authelia's config. Everything else stays unprivileged.
+3. **pcs network, private services** — `auth-registrar` and app backends. Not Caddy-labelled; not reachable from outside pcs. Backends are additionally firewalled behind their hash-lock sidecar at the routing layer (Caddy only labels the sidecar's container name, not the backend's).
+4. **Host** — the `auth-registrar` container mounts the Docker socket and `/DATA/AppData/yundera/auth`. This is the concentrated-risk surface: one audited container can invoke `docker run` and write Authelia's config. Everything else stays unprivileged.
 
 Redirect URI validation is the second line of defense if attestation is ever wrong: the registrar requires the first DNS label of every `redirect_uri` to equal the attested `client_id` or start with `client_id-`. See [mesh-router-auth/src/validation.ts](../../yundera-root/packages/mesh-router-root/mesh-router-auth/src/validation.ts) — the tests cover the typosquat cases (`myapp2.*` rejected).
 
@@ -145,9 +145,8 @@ Redirect URI validation is the second line of defense if attestation is ever wro
 To opt an app into OIDC auth:
 
 1. Compose the app with a hash-lock sidecar whose `container_name` matches the app name (mesh-router routing constraint).
-2. Attach the sidecar to the external `pcs` network so it can reach `authelia-registrar`.
-3. Set `AUTH_OIDC: "true"` on the sidecar. No secrets to inject — the sidecar self-registers.
-4. (Optional) override `OIDC_REGISTRAR_URL` only if the registrar is reachable under a non-default name.
+2. Attach the sidecar to the external `pcs` network so it can reach `auth-registrar`.
+3. Set `OIDC_REGISTRAR_URL: "http://auth-registrar:9092"` on the sidecar. That single env var enables OIDC — no other secrets to inject, the sidecar self-registers.
 
 See the "OIDC via Yundera Authelia" example in [../README.md](../README.md) for a complete compose snippet.
 

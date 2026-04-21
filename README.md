@@ -34,13 +34,13 @@ environment:
   PASSWORD: "your-secure-password"       # Optional: Password for login page
   SESSION_DURATION_HOURS: "720"          # Optional: Session duration in hours (default: 720 = 30 days)
 
-  # OIDC authentication (Yundera-managed Authelia)
-  AUTH_OIDC: "true"                      # Optional: Enable OIDC mode. The sidecar self-registers
-                                         # with the mesh-router-auth service at boot, gets back
-                                         # client_id + client_secret + issuer_url, and runs
-                                         # authorization_code + PKCE. No per-app secrets to configure.
-  OIDC_REGISTRAR_URL: "http://authelia-registrar:9092"  # Optional: override the registrar location (default shown).
-                                                         # Must be reachable on the pcs network.
+  # OIDC authentication (Yundera-managed identity provider)
+  OIDC_REGISTRAR_URL: "http://auth-registrar:9092"  # Setting this enables OIDC mode. The sidecar
+                                                     # self-registers with the registrar at first
+                                                     # login, gets back client_id + client_secret +
+                                                     # issuer_url, and runs authorization_code + PKCE.
+                                                     # No per-app secrets to configure.
+                                                     # Must be reachable on the pcs network.
 ```
 
 **Bypass Options:**
@@ -65,13 +65,13 @@ environment:
 
 The system automatically selects the authentication mode based on which environment variables are configured:
 
-| AUTH_OIDC | AUTH_HASH | USER/PASSWORD | Mode | Behavior |
-|-----------|-----------|---------------|------|----------|
-| ✅ `true` | *(any)* | *(any)* | **OIDC** | Self-registers with Yundera's Authelia via mesh-router-auth, runs authorization_code+PKCE flow, drops a session cookie |
-| ❌ | ✅ Defined | ❌ Undefined | **Hash Only** | Require `?hash=` parameter, show 403 page on failure |
-| ❌ | ❌ Undefined | ✅ Defined | **Credentials Only** | Show login page, require username/password, no hash option |
-| ❌ | ✅ Defined | ✅ Defined | **Both Methods** | Accept either hash parameter OR valid login session |
-| ❌ | ❌ Undefined | ❌ Undefined | **No Authentication** | Allow all requests (security disabled) |
+| OIDC_REGISTRAR_URL | AUTH_HASH | USER/PASSWORD | Mode | Behavior |
+|--------------------|-----------|---------------|------|----------|
+| ✅ Set  | *(any)* | *(any)* | **OIDC** | Self-registers with the PCS's identity provider, runs authorization_code+PKCE, drops a session cookie |
+| ❌      | ✅ Defined | ❌ Undefined | **Hash Only** | Require `?hash=` parameter, show 403 page on failure |
+| ❌      | ❌ Undefined | ✅ Defined | **Credentials Only** | Show login page, require username/password, no hash option |
+| ❌      | ✅ Defined | ✅ Defined | **Both Methods** | Accept either hash parameter OR valid login session |
+| ❌      | ❌ Undefined | ❌ Undefined | **No Authentication** | Allow all requests (security disabled) |
 
 > **OIDC mode** currently supersedes hash/credentials rather than composing with them. Mixing is on the roadmap.
 
@@ -218,7 +218,7 @@ services:
   hashlock:
     image: ghcr.io/yundera/nginx-hash-lock:latest
     environment:
-      AUTH_OIDC: "true"                # Sidecar registers itself with the PCS's Authelia
+      OIDC_REGISTRAR_URL: "http://auth-registrar:9092"  # Presence enables OIDC mode
       BACKEND_HOST: "myapp"
       BACKEND_PORT: "8080"
       LISTEN_PORT: "80"
@@ -245,7 +245,7 @@ x-casaos:
 
 **What happens at first user hit:**
 1. User hits `https://myapp-alice.nsl.sh/` → nginx runs `auth_request` → 401 (no cookie).
-2. Nginx redirects to `/nhl-auth/oidc/login`, which POSTs to `http://authelia-registrar:9092/register`.
+2. Nginx redirects to `/nhl-auth/oidc/login`, which POSTs to `$OIDC_REGISTRAR_URL/register` (e.g. `http://auth-registrar:9092/register`).
 3. Registrar identifies the caller as container `hashlock` via PTR on the pcs network (or whatever the container is named — see the container-naming rule below), runs `register-oidc-client.sh`, returns `{client_id, client_secret, issuer_url}`.
 4. Sidecar initializes `openid-client`, kicks off authorization_code+PKCE, redirects browser to Authelia's `/authorize`.
 5. User logs in on Authelia → bounced back to `/nhl-auth/oidc/callback` → session cookie set → redirected to original URL.
@@ -522,7 +522,7 @@ Request → NGINX auth_request to auth service → Check session cookie
 Request → NGINX auth_request to auth service → Check session cookie
   ├─ Valid session (has oidcSub) → Backend
   └─ No/invalid session → Redirect to /nhl-auth/oidc/login
-      ├─ First call: POST to authelia-registrar → cache client creds in memory
+      ├─ First call: POST to auth-registrar → cache client creds in memory
       └─ Redirect to Authelia /authorize (PKCE S256)
           → Authelia login → /nhl-auth/oidc/callback
           → Exchange code for tokens → Mint session with oidcSub → Backend
