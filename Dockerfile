@@ -25,10 +25,14 @@ COPY nginx.conf /etc/nginx/nginx.conf
 COPY 403.html /usr/share/nginx/html/403.html
 COPY login.html /usr/share/nginx/html/login.html
 
-# Copy and install auth service
+# Copy and install auth service.
+# Use `npm ci` (not `npm install`) so builds are reproducible: it installs the
+# EXACT versions pinned in package-lock.json instead of re-resolving the ^ ranges
+# to whatever is latest at build time. Prevents a rebuild from silently shipping a
+# different oidc-provider/openid-client and changing OAuth behaviour.
 COPY auth-service /app/auth-service
 WORKDIR /app/auth-service
-RUN npm install --production
+RUN npm ci --omit=dev
 
 # Copy entrypoint script
 COPY entrypoint.sh /entrypoint.sh

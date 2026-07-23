@@ -49,6 +49,10 @@ environment:
   USER: "admin"                          # Optional: Username for login page
   PASSWORD: "your-secure-password"       # Optional: Password for login page
   SESSION_DURATION_HOURS: "720"          # Optional: Session duration in hours (default: 720 = 30 days)
+  SESSIONS_FILE: "/data/sessions.json"   # Optional: session persistence path (default shown). Mount a
+                                         # volume at /data so sessions survive container recreates;
+                                         # without one they only survive `docker restart`. Applies to
+                                         # every auth mode (password, hash, OIDC).
 
   # OIDC authentication (registrar-driven SSO)
   OIDC_REGISTRAR_URL: "http://auth-registrar:9092"  # Setting this enables OIDC mode. The sidecar

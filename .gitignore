@@ -1,2 +1,7 @@
 CLAUDE.md
 .claude/settings.local.json
+
+# Node deps are installed in the image via `npm ci`; never commit them.
+# package-lock.json IS committed (it pins versions for reproducible builds).
+node_modules/
+auth-service/node_modules/

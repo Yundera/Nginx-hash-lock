@@ -100,9 +100,61 @@ async function validateCredentialHeader(authHeader) {
 // When password changes (container restart), password-based sessions become invalid
 const PASSWORD_HASH = crypto.createHash('sha256').update(PASSWORD + USERNAME).digest('hex');
 
-// In-memory session store
+// Session store — a plain object behind a write-through file persistence layer,
+// so gate restarts/recreates no longer log every user out mid-TTL.
 // Format: { sessionId: { expires: timestamp, passwordHash?: string, authHash?: string, oidcSub?: string } }
-const sessions = {};
+//
+// Persisted at SESSIONS_FILE on the same /data volume as OAUTH_DATA_DIR and the
+// managed AUTH_HASH. Without a /data mount the file lands in the container layer
+// (survives `docker restart`, lost on recreate) — i.e. no worse than the old
+// in-memory behaviour, and no error. passwordHash/authHash invalidation still
+// applies to restored sessions: if the credential changed while the gate was
+// down, the session dies on its first check exactly as it would have live.
+const SESSIONS_FILE = process.env.SESSIONS_FILE || '/data/sessions.json';
+
+function loadSessions() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+        const now = Date.now();
+        const live = {};
+        let dropped = 0;
+        for (const [id, sess] of Object.entries(raw)) {
+            if (sess && typeof sess.expires === 'number' && sess.expires > now) live[id] = sess;
+            else dropped++;
+        }
+        console.log(`[Auth Service] Restored ${Object.keys(live).length} session(s) from ${SESSIONS_FILE}` + (dropped ? ` (${dropped} expired dropped)` : ''));
+        return live;
+    } catch (e) {
+        if (e.code !== 'ENOENT') console.log(`[Auth Service] Could not restore sessions from ${SESSIONS_FILE}: ${e.message}`);
+        return {};
+    }
+}
+
+// Atomic write (temp + rename, same pattern as oauthFileAdapter), coalesced so
+// a burst of mutations (e.g. the hourly cleanup) produces one write.
+let sessionsSaveTimer = null;
+function saveSessionsSoon() {
+    if (sessionsSaveTimer) return;
+    sessionsSaveTimer = setTimeout(() => {
+        sessionsSaveTimer = null;
+        try {
+            fs.mkdirSync(path.dirname(SESSIONS_FILE), { recursive: true });
+            const tmp = `${SESSIONS_FILE}.${process.pid}.tmp`;
+            // 0600: session IDs are bearer secrets.
+            fs.writeFileSync(tmp, JSON.stringify(sessions), { mode: 0o600 });
+            fs.renameSync(tmp, SESSIONS_FILE);
+        } catch (e) {
+            console.log(`[Auth Service] Could not persist sessions to ${SESSIONS_FILE}: ${e.message}`);
+        }
+    }, 100);
+}
+
+// Write-through: every assignment/delete on `sessions` schedules a persist, so
+// all login/logout call sites stay plain object mutations.
+const sessions = new Proxy(loadSessions(), {
+    set(target, prop, value) { target[prop] = value; saveSessionsSoon(); return true; },
+    deleteProperty(target, prop) { delete target[prop]; saveSessionsSoon(); return true; },
+});
 
 // OIDC state: the client is lazy-initialized on the first /oidc/login request, because we
 // need the public Host header to compute the redirect URI before calling the registrar.
