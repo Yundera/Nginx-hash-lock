@@ -20,14 +20,26 @@ const SESSION_DURATION_MS = SESSION_DURATION_HOURS * 60 * 60 * 1000;
 const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || '').replace(/\/+$/, '');
 const OIDC_ENABLED = OIDC_REGISTRAR_URL.length > 0;
 
-// --- MCP OAuth 2.1 broker (opt-in) ------------------------------------------
-// When MCP_OAUTH_RESOURCE is set, AppShield additionally runs an OAuth 2.1 /
+// --- OAuth 2.1 broker (opt-in) ------------------------------------------
+// When OAUTH_RESOURCE is set, AppShield additionally runs an OAuth 2.1 /
 // OIDC Authorization Server (panva oidc-provider) that fronts Dex, so remote
-// MCP clients (claude.ai via DCR, n8n via a manually-created client) can obtain
-// Bearer tokens for the backend's /mcp endpoint. When unset, NONE of this code
+// OAuth clients (claude.ai via DCR, or a manually-created client) can obtain
+// Bearer tokens for the protected resource. When unset, NONE of this code
 // activates and AppShield behaves exactly as before.
-const MCP_OAUTH_RESOURCE = (process.env.MCP_OAUTH_RESOURCE || '').trim();
-const MCP_OAUTH_ENABLED = MCP_OAUTH_RESOURCE.length > 0;
+//
+// OAUTH_RESOURCE is the resource URL this proxy fronts (RFC 8707 resource
+// indicator / RFC 9728 protected resource); MCP_OAUTH_RESOURCE is accepted as a
+// back-compat alias. AppShield knows nothing about what the resource IS — the
+// protected PATH is derived from the resource URL (never hardcoded), and
+// OAUTH_SCOPE is a free-form label the resource advertises and grants (not
+// enforced at the gate today). All resource-specific values live in the app's
+// compose, not here.
+const OAUTH_RESOURCE = (process.env.OAUTH_RESOURCE || process.env.MCP_OAUTH_RESOURCE || '').trim();
+const OAUTH_ENABLED = OAUTH_RESOURCE.length > 0;
+const OAUTH_SCOPE = (process.env.OAUTH_SCOPE || 'access').trim();
+// The single path we protect + emit the RFC 9728 challenge for, taken straight
+// from the resource URL's path (e.g. https://host/mcp -> "/mcp"). "/" when off.
+const OAUTH_PROTECTED_PATH = OAUTH_ENABLED ? new URL(OAUTH_RESOURCE).pathname : '/';
 const OAUTH_DATA_DIR = process.env.OAUTH_DATA_DIR || '/data/oauth';
 
 // --- Public host set (multi-domain SSO) -------------------------------------
@@ -161,13 +173,13 @@ const sessions = new Proxy(loadSessions(), {
 let oidcClient = null;
 let oidcIssuerUrl = null;
 
-// MCP OAuth provider state — populated asynchronously by bootstrapMcpProvider()
+// OAuth provider state — populated asynchronously by bootstrapOauthProvider()
 // after app.listen (oidc-provider v9 is ESM-only, loaded via dynamic import).
-let mcpProvider = null;          // the oidc-provider Provider instance
-let mcpProviderCallback = null;  // provider.callback() — Node request handler
-let mcpLocalJWKS = null;         // jose local JWKS for verifying /mcp bearer tokens
-let mcpJose = null;              // the imported jose module
-let MCP_ISSUER = null;           // single fixed issuer origin
+let oauthProvider = null;          // the oidc-provider Provider instance
+let oauthProviderCallback = null;  // provider.callback() — Node request handler
+let oauthLocalJWKS = null;         // jose local JWKS for verifying /mcp bearer tokens
+let oauthJose = null;              // the imported jose module
+let OAUTH_ISSUER = null;           // single fixed issuer origin
 
 // Pending authorization-code flows keyed by OAuth `state`: { codeVerifier, originalUri, createdAt }
 const pendingOidcFlows = new Map();
@@ -270,25 +282,26 @@ app.set('trust proxy', true);
 // generic body parsers consume the stream first, the token endpoint 400s. Skip
 // them for provider protocol paths (the admin /AppShield/oauth* JSON endpoints
 // are NOT skipped — they want parsed JSON).
-const isMcpProtocolPath = (p) =>
+const isOauthProtocolPath = (p) =>
     p.startsWith('/AppShield/oidc') ||
     p === '/.well-known/openid-configuration' ||
     p === '/.well-known/oauth-authorization-server';
 const skipForProtocol = (mw) => (req, res, next) =>
-    isMcpProtocolPath(req.path) ? next() : mw(req, res, next);
+    isOauthProtocolPath(req.path) ? next() : mw(req, res, next);
 app.use(skipForProtocol(express.json()));
 app.use(skipForProtocol(express.urlencoded({ extended: true })));
 app.use(cookieParser());
 
 // Send a 401, attaching the RFC 9728 discovery challenge when the original
-// request targeted /mcp so MCP clients (claude.ai) can find the auth server.
+// request targeted the protected path so OAuth clients (claude.ai) can find the
+// auth server.
 function sendUnauthorized(req, res, message = 'Unauthorized') {
-    if (MCP_OAUTH_ENABLED && MCP_ISSUER) {
+    if (OAUTH_ENABLED && OAUTH_ISSUER) {
         const orig = req.headers['x-original-uri'] || '';
-        if (orig.startsWith('/mcp')) {
+        if (orig.startsWith(OAUTH_PROTECTED_PATH)) {
             res.set(
                 'WWW-Authenticate',
-                `Bearer resource_metadata="${MCP_ISSUER}/.well-known/oauth-protected-resource"`
+                `Bearer resource_metadata="${OAUTH_ISSUER}/.well-known/oauth-protected-resource"`
             );
         }
     }
@@ -568,22 +581,22 @@ app.get('/nhl-auth/check', async (req, res) => {
         }
     }
 
-    // MCP OAuth: accept a Bearer JWT access token issued by our own provider.
+    // OAuth: accept a Bearer JWT access token issued by our own provider.
     // Only attempted for 3-segment tokens, so the opaque AUTH_HASH bearer above
     // and these JWTs coexist on the same gate.
-    if (MCP_OAUTH_ENABLED && mcpLocalJWKS && mcpJose) {
+    if (OAUTH_ENABLED && oauthLocalJWKS && oauthJose) {
         const authHeader = req.headers['authorization'] || '';
         const m = /^Bearer\s+(.+)$/i.exec(authHeader);
         if (m && m[1].split('.').length === 3) {
             try {
-                await mcpJose.jwtVerify(m[1], mcpLocalJWKS, {
-                    issuer: MCP_ISSUER,
-                    audience: MCP_OAUTH_RESOURCE,
+                await oauthJose.jwtVerify(m[1], oauthLocalJWKS, {
+                    issuer: OAUTH_ISSUER,
+                    audience: OAUTH_RESOURCE,
                 });
-                console.log('[Auth Service] Auth check passed via MCP Bearer JWT');
+                console.log('[Auth Service] Auth check passed via Bearer JWT');
                 return res.status(200).send('OK');
             } catch (e) {
-                console.log(`[Auth Service] MCP Bearer JWT rejected: ${e.message}`);
+                console.log(`[Auth Service] Bearer JWT rejected: ${e.message}`);
                 // fall through to the remaining checks / 401
             }
         }
@@ -799,11 +812,11 @@ app.get('/health', (req, res) => {
 });
 
 // ===========================================================================
-// MCP OAuth 2.1 Authorization Server (opt-in, fronts Dex)
+// OAuth 2.1 Authorization Server (opt-in, fronts Dex)
 // ===========================================================================
 
 const OAUTH_ADMIN_PAGE = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>MCP Remote Access</title>
+<html><head><meta charset="utf-8"><title>Remote Access</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
   body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f4f5f7;color:#2c3e50;margin:0;padding:2rem;}
@@ -821,8 +834,8 @@ const OAUTH_ADMIN_PAGE = `<!DOCTYPE html>
   .muted{color:#888;font-size:.85rem;}
 </style></head>
 <body><div class="wrap">
-  <h1>MCP Remote Access (OAuth 2.1)</h1>
-  <p class="muted">Connect remote MCP clients (claude.ai, n8n, …) to this server securely. claude.ai registers itself automatically; clients that cannot self-register (e.g. n8n) need a manual client below.</p>
+  <h1>Remote Access (OAuth 2.1)</h1>
+  <p class="muted">Connect remote OAuth clients (claude.ai, n8n, …) to this server securely. claude.ai registers itself automatically; clients that cannot self-register (e.g. n8n) need a manual client below.</p>
 
   <div class="card" id="info"><h2>Connection</h2><div id="info-body" class="muted">Loading…</div></div>
 
@@ -843,7 +856,7 @@ const J = (r) => r.json();
 async function loadInfo(){
   const i = await fetch('oauth/info').then(J);
   document.getElementById('info-body').innerHTML =
-    '<p>Give this URL to a remote MCP client:</p><p><code>'+i.resource+'</code></p>'+
+    '<p>Give this URL to a remote OAuth client:</p><p><code>'+i.resource+'</code></p>'+
     '<p class="muted">Issuer: <code>'+i.issuer+'</code></p>';
 }
 async function loadClients(){
@@ -883,16 +896,16 @@ async function delClient(id){
 loadInfo(); loadClients();
 </script></body></html>`;
 
-async function bootstrapMcpProvider() {
+async function bootstrapOauthProvider() {
     const fsp = fs.promises;
     fs.mkdirSync(OAUTH_DATA_DIR, { recursive: true });
 
     const { default: Provider } = await import('oidc-provider');
-    mcpJose = await import('jose');
+    oauthJose = await import('jose');
 
     // Issuer = the canonical public origin (single fixed value; oidc-provider
     // does not support per-host issuers). Fall back to the resource's origin.
-    MCP_ISSUER = CANONICAL_ORIGIN || new URL(MCP_OAUTH_RESOURCE).origin;
+    OAUTH_ISSUER = CANONICAL_ORIGIN || new URL(OAUTH_RESOURCE).origin;
 
     // --- Persisted signing keys (JWKS) & cookie keys ------------------------
     const jwksFile = path.join(OAUTH_DATA_DIR, 'jwks.json');
@@ -900,8 +913,8 @@ async function bootstrapMcpProvider() {
     if (fs.existsSync(jwksFile)) {
         jwks = JSON.parse(fs.readFileSync(jwksFile, 'utf8'));
     } else {
-        const { privateKey } = await mcpJose.generateKeyPair('RS256', { extractable: true });
-        const jwk = await mcpJose.exportJWK(privateKey);
+        const { privateKey } = await oauthJose.generateKeyPair('RS256', { extractable: true });
+        const jwk = await oauthJose.exportJWK(privateKey);
         jwk.use = 'sig';
         jwk.alg = 'RS256';
         jwk.kid = crypto.randomBytes(8).toString('hex');
@@ -915,7 +928,7 @@ async function bootstrapMcpProvider() {
             return pub;
         }),
     };
-    mcpLocalJWKS = mcpJose.createLocalJWKSet(publicJwks);
+    oauthLocalJWKS = oauthJose.createLocalJWKSet(publicJwks);
 
     const cookieKeysFile = path.join(OAUTH_DATA_DIR, 'cookie-keys.json');
     let cookieKeys;
@@ -948,8 +961,8 @@ async function bootstrapMcpProvider() {
         // Supported scopes. Must be a superset of whatever remote clients request
         // at Dynamic Client Registration, or oidc-provider rejects the registration
         // with invalid_client_metadata. claude.ai requests standard OIDC scopes plus
-        // the advertised resource scope ('mcp'), so all are registered here.
-        scopes: ['openid', 'offline_access', 'profile', 'email', 'mcp'],
+        // the advertised resource scope (OAUTH_SCOPE), so all are registered here.
+        scopes: ['openid', 'offline_access', 'profile', 'email', OAUTH_SCOPE],
         claims: { openid: ['sub'] },
         interactions: {
             url: (ctx, interaction) => `/AppShield/interaction/${interaction.uid}`,
@@ -964,11 +977,11 @@ async function bootstrapMcpProvider() {
             registration: { enabled: true, initialAccessToken: false },
             resourceIndicators: {
                 enabled: true,
-                defaultResource: () => MCP_OAUTH_RESOURCE,
+                defaultResource: () => OAUTH_RESOURCE,
                 useGrantedResource: () => true,
                 getResourceServerInfo: () => ({
-                    scope: 'mcp',
-                    audience: MCP_OAUTH_RESOURCE,
+                    scope: OAUTH_SCOPE,
+                    audience: OAUTH_RESOURCE,
                     accessTokenTTL: 3600,
                     accessTokenFormat: 'jwt',
                 }),
@@ -985,52 +998,52 @@ async function bootstrapMcpProvider() {
         },
     };
 
-    mcpProvider = new Provider(MCP_ISSUER, configuration);
-    mcpProvider.proxy = true;
-    mcpProviderCallback = mcpProvider.callback();
+    oauthProvider = new Provider(OAUTH_ISSUER, configuration);
+    oauthProvider.proxy = true;
+    oauthProviderCallback = oauthProvider.callback();
 
     // Diagnostics: log DCR / authorization / server errors so failed remote-client
     // registrations (e.g. claude.ai) are visible in the auth-service log.
-    mcpProvider.on('registration_create.error', (ctx, err) => {
+    oauthProvider.on('registration_create.error', (ctx, err) => {
         console.log(`[Auth Service] DCR error: ${err.message} | body=${JSON.stringify(ctx.oidc && ctx.oidc.body)}`);
     });
-    mcpProvider.on('authorization.error', (ctx, err) => {
+    oauthProvider.on('authorization.error', (ctx, err) => {
         console.log(`[Auth Service] authorization error: ${err.message} | desc=${err.error_description} | detail=${err.error_detail || ''}`);
     });
-    mcpProvider.on('server_error', (ctx, err) => {
+    oauthProvider.on('server_error', (ctx, err) => {
         console.error('[Auth Service] oidc server_error:', err && err.stack || err);
     });
 
     // Route provider-owned paths to oidc-provider; everything else falls through.
     app.use((req, res, next) => {
-        if (!mcpProviderCallback) return next();
+        if (!oauthProviderCallback) return next();
         if (req.path === '/.well-known/openid-configuration' || req.path.startsWith('/AppShield/oidc')) {
-            return mcpProviderCallback(req, res);
+            return oauthProviderCallback(req, res);
         }
         return next();
     });
 
-    // RFC 8414 alias — MCP clients fetch oauth-authorization-server; re-dispatch
+    // RFC 8414 alias — OAuth clients fetch oauth-authorization-server; re-dispatch
     // to the provider's own discovery doc so the two never drift.
     app.get('/.well-known/oauth-authorization-server', (req, res) => {
         req.url = '/.well-known/openid-configuration';
-        mcpProviderCallback(req, res);
+        oauthProviderCallback(req, res);
     });
 
     // RFC 9728 Protected Resource Metadata (this server is the RS for /mcp).
     app.get('/.well-known/oauth-protected-resource', (req, res) => {
         res.json({
-            resource: MCP_OAUTH_RESOURCE,
-            authorization_servers: [MCP_ISSUER],
+            resource: OAUTH_RESOURCE,
+            authorization_servers: [OAUTH_ISSUER],
             bearer_methods_supported: ['header'],
-            scopes_supported: ['mcp'],
+            scopes_supported: [OAUTH_SCOPE],
         });
     });
 
     // Interaction endpoint — the single bridge into the existing Dex login flow.
     app.get('/AppShield/interaction/:uid', async (req, res) => {
         try {
-            const details = await mcpProvider.interactionDetails(req, res);
+            const details = await oauthProvider.interactionDetails(req, res);
             const { prompt, params } = details;
 
             // Resolve the authenticated human from our existing session store.
@@ -1046,7 +1059,7 @@ async function bootstrapMcpProvider() {
             }
 
             if (prompt.name === 'login') {
-                return mcpProvider.interactionFinished(
+                return oauthProvider.interactionFinished(
                     req, res, { login: { accountId } }, { mergeWithLastSubmission: false }
                 );
             }
@@ -1057,8 +1070,8 @@ async function bootstrapMcpProvider() {
                 // the consent prompt is fully satisfied and the provider doesn't loop
                 // back asking for more.
                 const grant = details.grantId
-                    ? await mcpProvider.Grant.find(details.grantId)
-                    : new mcpProvider.Grant({ accountId, clientId: params.client_id });
+                    ? await oauthProvider.Grant.find(details.grantId)
+                    : new oauthProvider.Grant({ accountId, clientId: params.client_id });
                 const d = prompt.details;
                 if (d.missingOIDCScope) grant.addOIDCScope(d.missingOIDCScope.join(' '));
                 if (d.missingOIDCClaims) grant.addOIDCClaims(d.missingOIDCClaims);
@@ -1068,15 +1081,15 @@ async function bootstrapMcpProvider() {
                     }
                 }
                 const grantId = await grant.save();
-                return mcpProvider.interactionFinished(
+                return oauthProvider.interactionFinished(
                     req, res, { consent: { grantId } }, { mergeWithLastSubmission: true }
                 );
             }
 
             // Unknown prompt — finish with what we have.
-            return mcpProvider.interactionFinished(req, res, { login: { accountId } });
+            return oauthProvider.interactionFinished(req, res, { login: { accountId } });
         } catch (err) {
-            console.error('[Auth Service] MCP interaction error:', err);
+            console.error('[Auth Service] interaction error:', err);
             res.status(500).send('Interaction error: ' + err.message);
         }
     });
@@ -1088,12 +1101,12 @@ async function bootstrapMcpProvider() {
 
     app.get('/AppShield/oauth/info', requireHumanSession, (req, res) => {
         res.json({
-            issuer: MCP_ISSUER,
-            resource: MCP_OAUTH_RESOURCE,
-            authorization_endpoint: `${MCP_ISSUER}/AppShield/oidc/auth`,
-            token_endpoint: `${MCP_ISSUER}/AppShield/oidc/token`,
-            registration_endpoint: `${MCP_ISSUER}/AppShield/oidc/reg`,
-            scopes_supported: ['mcp'],
+            issuer: OAUTH_ISSUER,
+            resource: OAUTH_RESOURCE,
+            authorization_endpoint: `${OAUTH_ISSUER}/AppShield/oidc/auth`,
+            token_endpoint: `${OAUTH_ISSUER}/AppShield/oidc/token`,
+            registration_endpoint: `${OAUTH_ISSUER}/AppShield/oidc/reg`,
+            scopes_supported: [OAUTH_SCOPE],
         });
     });
 
@@ -1134,16 +1147,16 @@ async function bootstrapMcpProvider() {
             grant_types: ['authorization_code', 'refresh_token'],
             response_types: ['code'],
             token_endpoint_auth_method: 'client_secret_basic',
-            scope: 'openid offline_access',
+            scope: `openid ${OAUTH_SCOPE} offline_access`,
             appshield_origin: 'manual',
         };
         await new OAuthFileAdapter('Client').upsert(client_id, metadata);
         res.json({
             client_id,
             client_secret,
-            authorization_endpoint: `${MCP_ISSUER}/AppShield/oidc/auth`,
-            token_endpoint: `${MCP_ISSUER}/AppShield/oidc/token`,
-            scope: 'openid mcp offline_access',
+            authorization_endpoint: `${OAUTH_ISSUER}/AppShield/oidc/auth`,
+            token_endpoint: `${OAUTH_ISSUER}/AppShield/oidc/token`,
+            scope: `openid ${OAUTH_SCOPE} offline_access`,
         });
     });
 
@@ -1152,7 +1165,7 @@ async function bootstrapMcpProvider() {
         res.json({ revoked: req.params.id });
     });
 
-    console.log(`[Auth Service] MCP OAuth provider ready (issuer=${MCP_ISSUER}, resource=${MCP_OAUTH_RESOURCE})`);
+    console.log(`[Auth Service] OAuth provider ready (issuer=${OAUTH_ISSUER}, resource=${OAUTH_RESOURCE})`);
 }
 
 // Start server
@@ -1164,12 +1177,12 @@ app.listen(PORT, () => {
     console.log(`[Auth Service] Password configured: ${PASSWORD ? 'Yes' : 'No'}`);
     console.log(`[Auth Service] OIDC enabled: ${OIDC_ENABLED ? `Yes (registrar=${OIDC_REGISTRAR_URL})` : 'No'}`);
     console.log(`[Auth Service] Session duration: ${SESSION_DURATION_HOURS} hours`);
-    console.log(`[Auth Service] MCP OAuth enabled: ${MCP_OAUTH_ENABLED ? `Yes (resource=${MCP_OAUTH_RESOURCE})` : 'No'}`);
+    console.log(`[Auth Service] OAuth enabled: ${OAUTH_ENABLED ? `Yes (resource=${OAUTH_RESOURCE})` : 'No'}`);
     console.log('=====================================');
 
-    if (MCP_OAUTH_ENABLED) {
-        bootstrapMcpProvider().catch((err) => {
-            console.error('[Auth Service] MCP OAuth bootstrap failed (human auth unaffected):', err);
+    if (OAUTH_ENABLED) {
+        bootstrapOauthProvider().catch((err) => {
+            console.error('[Auth Service] OAuth bootstrap failed (human auth unaffected):', err);
         });
     }
 });

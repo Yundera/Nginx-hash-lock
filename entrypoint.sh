@@ -144,10 +144,16 @@ if [ "$AUTH_MODE" = "oidc_only" ] && [ "$MACHINE_AUTH" = "1" ]; then
 fi
 echo "========================================="
 
+# Resolve the OAuth-broker resource once: OAUTH_RESOURCE is the generic name,
+# MCP_OAUTH_RESOURCE is accepted as a back-compat alias. Exported so the node
+# auth-service inherits the resolved value.
+OAUTH_RESOURCE="${OAUTH_RESOURCE:-$MCP_OAUTH_RESOURCE}"
+export OAUTH_RESOURCE
+
 # Start auth service if any authentication is configured (for session management).
-# Also start it when the MCP OAuth broker is enabled, since the provider runs
-# inside the auth-service node process.
-if [ "$AUTH_MODE" = "hash_only" ] || [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ] || [ "$AUTH_MODE" = "oidc_only" ] || [ -n "$MCP_OAUTH_RESOURCE" ]; then
+# Also start it when the OAuth broker is enabled, since the provider runs inside
+# the auth-service node process.
+if [ "$AUTH_MODE" = "hash_only" ] || [ "$AUTH_MODE" = "credentials_only" ] || [ "$AUTH_MODE" = "both" ] || [ "$AUTH_MODE" = "oidc_only" ] || [ -n "$OAUTH_RESOURCE" ]; then
     echo "Starting authentication service..."
     export SESSION_DURATION_HOURS="${SESSION_DURATION_HOURS:-720}"
     cd /app/auth-service
@@ -351,17 +357,21 @@ fi
 sed -i "s/AUTH_CHECK_BLOCK_PLACEHOLDER/$AUTH_CHECK_ESCAPED/" /etc/nginx/nginx.conf
 
 # ---------------------------------------------------------------------------
-# MCP OAuth 2.1 broker (opt-in via MCP_OAUTH_RESOURCE)
-# When enabled, write an include file with the OAuth/MCP location blocks and
-# splice it in via the MCP_OAUTH_BLOCK_PLACEHOLDER. When disabled, the
-# placeholder is removed -> byte-identical nginx behaviour to before.
+# OAuth 2.1 broker (opt-in via OAUTH_RESOURCE; MCP_OAUTH_RESOURCE alias resolved
+# above). When enabled, write an include file with the OAuth location blocks and
+# splice it in via the OAUTH_BLOCK_PLACEHOLDER. When disabled, the placeholder is
+# removed -> byte-identical nginx behaviour to before.
 # ---------------------------------------------------------------------------
-if [ -n "$MCP_OAUTH_RESOURCE" ]; then
-    echo "MCP OAuth enabled (resource=$MCP_OAUTH_RESOURCE) — adding OAuth/MCP nginx routes"
+if [ -n "$OAUTH_RESOURCE" ]; then
+    # Protect exactly the path the resource URL points at (never hardcode it):
+    # e.g. https://host/mcp -> "/mcp". Empty path falls back to "/".
+    OAUTH_PATH=$(printf '%s' "$OAUTH_RESOURCE" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+##')
+    [ -z "$OAUTH_PATH" ] && OAUTH_PATH="/"
+    echo "OAuth broker enabled (resource=$OAUTH_RESOURCE, path=$OAUTH_PATH) — adding OAuth nginx routes"
     mkdir -p "${OAUTH_DATA_DIR:-/data/oauth}"
 
-    cat > /tmp/mcp_oauth.conf <<EOF
-        # === MCP OAuth 2.1 broker — auth-service (oidc-provider) on :9999 ===
+    cat > /tmp/oauth.conf <<EOF
+        # === OAuth 2.1 broker — auth-service (oidc-provider) on :9999 ===
         location = /.well-known/openid-configuration {
             proxy_pass http://127.0.0.1:9999;
             proxy_http_version 1.1;
@@ -395,11 +405,11 @@ if [ -n "$MCP_OAUTH_RESOURCE" ]; then
             proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
             proxy_set_header Cookie \$http_cookie;
         }
-        # /mcp — gated by Bearer JWT / hash via auth_request. On a 401 from the
-        # auth subrequest, nginx auto-propagates its WWW-Authenticate header to
-        # the client (the RFC 9728 discovery challenge set by /nhl-auth/check),
-        # so no human login redirect and no manual header re-emission is needed.
-        location ^~ /mcp {
+        # Protected resource path — gated by Bearer JWT / hash via auth_request. On
+        # a 401 from the auth subrequest, nginx auto-propagates its WWW-Authenticate
+        # header (the RFC 9728 discovery challenge set by /nhl-auth/check), so no
+        # human login redirect and no manual header re-emission is needed.
+        location ^~ $OAUTH_PATH {
             auth_request /internal-auth-check;
             set \$backend_upstream "$BACKEND_HOST:$BACKEND_PORT";
             proxy_pass http://\$backend_upstream;
@@ -416,9 +426,9 @@ if [ -n "$MCP_OAUTH_RESOURCE" ]; then
         }
 EOF
 
-    sed -i 's|MCP_OAUTH_BLOCK_PLACEHOLDER|        include /tmp/mcp_oauth.conf;|' /etc/nginx/nginx.conf
+    sed -i 's|OAUTH_BLOCK_PLACEHOLDER|        include /tmp/oauth.conf;|' /etc/nginx/nginx.conf
 else
-    sed -i 's|MCP_OAUTH_BLOCK_PLACEHOLDER||' /etc/nginx/nginx.conf
+    sed -i 's|OAUTH_BLOCK_PLACEHOLDER||' /etc/nginx/nginx.conf
 fi
 
 echo "========================================="
