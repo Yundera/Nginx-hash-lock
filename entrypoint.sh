@@ -121,10 +121,10 @@ export AUTH_HASH
 # the SSO flow. (USER/PASSWORD credential mode does NOT compose with OIDC.)
 # OIDC is considered enabled iff OIDC_REGISTRAR_URL is set (points at the registrar
 # on the pcs network, typically http://auth-registrar:9092).
-# Machine/API auth is enabled by a static AUTH_HASH and/or an external credential
-# validator (CREDENTIAL_VALIDATE_URL — e.g. the CasaOS bridge, for real per-user
-# API identity). Either one composes with the human methods exactly like a hash.
-if [ -n "$AUTH_HASH" ] || [ -n "$CREDENTIAL_VALIDATE_URL" ]; then MACHINE_AUTH=1; else MACHINE_AUTH=0; fi
+# Machine/API auth is enabled by a static AUTH_HASH, which composes with the human
+# methods. (For an OAuth-protected resource see OAUTH_RESOURCE further down — that
+# is the other non-interactive path, and it does not go through MACHINE_AUTH.)
+if [ -n "$AUTH_HASH" ]; then MACHINE_AUTH=1; else MACHINE_AUTH=0; fi
 
 AUTH_MODE="none"
 if [ -n "$OIDC_REGISTRAR_URL" ]; then
@@ -137,10 +137,26 @@ elif [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
     AUTH_MODE="credentials_only"
 fi
 
+# CREDENTIAL_VALIDATE_URL was removed in 2.0.8. It used to delegate an
+# Authorization header to an external validator (the CasaOS bridge's /validate)
+# and counted as machine auth. Warn if a stale compose still sets it, and refuse
+# to start if it was the ONLY thing standing between this app and the internet —
+# silently downgrading to "no authentication" would be worse than not booting.
+if [ -n "$CREDENTIAL_VALIDATE_URL" ]; then
+    echo "WARNING: CREDENTIAL_VALIDATE_URL is no longer supported and is ignored."
+    echo "         Use OAUTH_RESOURCE, or AUTH_HASH with AUTH_HASH_MODE=env|managed,"
+    echo "         for non-interactive access. Remove it from your compose file."
+    if [ "$AUTH_MODE" = "none" ]; then
+        echo "ERROR: it was the only authentication configured — refusing to start"
+        echo "       unprotected. Set one of the mechanisms above."
+        exit 1
+    fi
+fi
+
 echo "========================================="
 echo "Authentication Mode: $AUTH_MODE"
 if [ "$AUTH_MODE" = "oidc_only" ] && [ "$MACHINE_AUTH" = "1" ]; then
-    echo "  + machine/API bypass enabled (hash and/or CasaOS credentials via header)"
+    echo "  + machine/API bypass enabled (AUTH_HASH via ?hash= / Basic / Bearer)"
 fi
 echo "========================================="
 

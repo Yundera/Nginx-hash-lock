@@ -73,41 +73,6 @@ if (OIDC_ENABLED) {
     console.log(`[Auth Service] app=${APP_NAME} public hosts: ${APP_HOSTS.join(', ') || '(none — falling back to request Host)'}`);
 }
 
-// External credential validation (MACHINE / API, no redirect). When set, an
-// Authorization header (HTTP Basic `user:pass` or `Bearer <token>`) that does NOT
-// match the static AUTH_HASH is forwarded to this URL for verification — e.g. the
-// casaos-oidc-bridge `/validate` endpoint, which checks it against CasaOS. This lets
-// API clients authenticate with their real CasaOS identity instead of (or alongside)
-// a shared AUTH_HASH. It is product-agnostic: AppShield only knows "POST the header
-// here, 200 = valid". The validator must be an internal-only endpoint — the bridge
-// serves /validate on a pcs-network-only port — so no shared secret is needed.
-const CREDENTIAL_VALIDATE_URL = (process.env.CREDENTIAL_VALIDATE_URL || '').replace(/\/+$/, '');
-const CREDENTIAL_CACHE_TTL_MS = parseInt(process.env.CREDENTIAL_CACHE_TTL_SECONDS || '60', 10) * 1000;
-// Cache of validated Authorization headers: sha256(header) -> expiry. Avoids calling
-// the validator (and CasaOS) on every request from a machine that re-sends creds.
-const credCache = new Map();
-
-// Validate an Authorization header against the external validator, with caching.
-async function validateCredentialHeader(authHeader) {
-    if (!CREDENTIAL_VALIDATE_URL || !authHeader) return false;
-    const key = crypto.createHash('sha256').update(authHeader).digest('hex');
-    const cached = credCache.get(key);
-    if (cached) {
-        if (cached > Date.now()) return true;
-        credCache.delete(key);
-    }
-    try {
-        const resp = await fetch(CREDENTIAL_VALIDATE_URL, { method: 'POST', headers: { 'Authorization': authHeader } });
-        if (resp.ok) {
-            if (CREDENTIAL_CACHE_TTL_MS > 0) credCache.set(key, Date.now() + CREDENTIAL_CACHE_TTL_MS);
-            return true;
-        }
-    } catch (e) {
-        console.log(`[Auth Service] Credential validation error: ${e.message}`);
-    }
-    return false;
-}
-
 // Generate password hash for session validation
 // When password changes (container restart), password-based sessions become invalid
 const PASSWORD_HASH = crypto.createHash('sha256').update(PASSWORD + USERNAME).digest('hex');
@@ -602,17 +567,6 @@ app.get('/nhl-auth/check', async (req, res) => {
         }
     }
 
-    // Static hash didn't match — delegate the Authorization header to the external
-    // credential validator (e.g. the CasaOS bridge /validate) for real per-user API
-    // identity. Basic (user:pass) and Bearer (token) are both handled by the validator.
-    if (CREDENTIAL_VALIDATE_URL) {
-        const authHeader = req.headers['authorization'] || '';
-        if (authHeader && await validateCredentialHeader(authHeader)) {
-            console.log('[Auth Service] Auth check passed via external credential validation');
-            return res.status(200).send('OK');
-        }
-    }
-
     // Check session cookie again (for cases where hash auth wasn't valid)
     sessionId = req.cookies.appshield_session;
 
@@ -991,9 +945,13 @@ async function bootstrapOauthProvider() {
             AccessToken: 3600,
             AuthorizationCode: 600,
             IdToken: 3600,
-            RefreshToken: 14 * 24 * 3600,
+            // 90 days: long-lived clients (an aggregator holding this endpoint)
+            // only need a human again once the refresh token or the grant
+            // expires. At 14 days that meant a re-login every fortnight even for
+            // something in constant use.
+            RefreshToken: 90 * 24 * 3600,
             Interaction: 3600,
-            Grant: 14 * 24 * 3600,
+            Grant: 90 * 24 * 3600,
             Session: SESSION_DURATION_HOURS * 3600,
         },
     };
@@ -1036,7 +994,15 @@ async function bootstrapOauthProvider() {
             resource: OAUTH_RESOURCE,
             authorization_servers: [OAUTH_ISSUER],
             bearer_methods_supported: ['header'],
-            scopes_supported: [OAUTH_SCOPE],
+            // offline_access is advertised on purpose. Per the MCP spec's scope
+            // selection strategy, a client takes its scopes from here (or from
+            // the WWW-Authenticate challenge) and asks for nothing else — so
+            // without it, no client ever requests offline access, oidc-provider
+            // issues no refresh token, and every consumer has to be
+            // re-authorized by a human once the 1h access token expires. That is
+            // merely annoying for a browser client like claude.ai; it makes
+            // unattended clients (a Beacon aggregating this endpoint) unusable.
+            scopes_supported: [OAUTH_SCOPE, 'offline_access'],
         });
     });
 

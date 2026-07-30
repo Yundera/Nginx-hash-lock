@@ -62,16 +62,15 @@ environment:
                                                      # No per-app secrets to configure.
                                                      # Must be reachable on the pcs network.
 
-  # CasaOS-credential API auth (MACHINE, real per-user identity, no redirect)
-  CREDENTIAL_VALIDATE_URL: ""             # When set, an "Authorization: Basic <user:pass>"
-                                          # or "Bearer <token>" that isn't the static AUTH_HASH
-                                          # is verified here — point it at the CasaOS bridge's
-                                          # INTERNAL /validate port (http://casaos-oidc-bridge:8090/validate),
-                                          # which checks it against CasaOS. Lets API clients use
-                                          # `-u <casaos-user>:<casaos-pass>`. No browser redirect.
-                                          # The validator is pcs-network-only, so no secret is needed.
-  CREDENTIAL_CACHE_TTL_SECONDS: "60"      # Optional: cache successful validations (default 60s)
 ```
+
+> **Removed in 2.0.8: `CREDENTIAL_VALIDATE_URL` / `CREDENTIAL_CACHE_TTL_SECONDS`.** These
+> delegated an `Authorization` header to an external validator (the CasaOS bridge's
+> `/validate`) so API clients could present real CasaOS credentials. The bridge is being
+> retired, so the mechanism went with it. A gate that still sets the variable logs a warning
+> and ignores it — and refuses to start if it was the only authentication configured, rather
+> than silently serving unprotected. Use `OAUTH_RESOURCE`, or `AUTH_HASH` with
+> `AUTH_HASH_MODE=env|managed`, for non-interactive access.
 
 **Bypass Options:**
 ```yaml
@@ -107,21 +106,17 @@ The three distinct mechanisms:
 |-----------|----------|----------------------------|--------------|
 | **Hash** | Machine / API | `?hash=<secret>` URL param **or** `Authorization: Bearer <secret>` **or** HTTP Basic (`-u any:<secret>`) | No |
 | **Web login** | Human | username/password form → session cookie | Yes |
-| **SSO (OIDC)** | Human | redirect to the identity provider (Dex → CasaOS), authorization_code + PKCE → session cookie | Yes |
+| **SSO (OIDC)** | Human | redirect to the identity provider (Dex → its connector), authorization_code + PKCE → session cookie | Yes |
 
 > **Hash = "true" HTTP Basic auth for machines.** In machine-only deployments the gate
 > answers an unauthenticated request with `401 WWW-Authenticate: Basic`, so standard tooling
 > (`curl -u`, HTTP client libraries) authenticates out of the box. The hash is the credential —
 > it is checked against `AUTH_HASH`, never `USER`/`PASSWORD`.
 
-> **CasaOS identity over the API.** Set `CREDENTIAL_VALIDATE_URL` (→ the CasaOS bridge's
-> `/validate`) so machine clients can authenticate with their **real CasaOS credentials** —
-> `-u <casaos-user>:<casaos-pass>` (HTTP Basic) or a CasaOS `Bearer` token — instead of, or
-> alongside, a shared `AUTH_HASH`. No browser redirect: the gate verifies the credential
-> out-of-band via the bridge (which checks it against CasaOS), so an API call carries a real
-> per-user identity. Successful checks are cached for `CREDENTIAL_CACHE_TTL_SECONDS`. This is
-> a machine mechanism — humans still use Web login or SSO. (OIDC's password grant can't reach
-> CasaOS through Dex, which is why this goes via the bridge, not Dex.)
+> **Machine access beyond the hash.** For OAuth 2.1 Bearer tokens on a specific path
+> (MCP endpoints and similar), see `OAUTH_RESOURCE` — that path is gated independently of
+> the mode table below. Delegating credentials to an external validator
+> (`CREDENTIAL_VALIDATE_URL`) was removed in 2.0.8; see the note above.
 
 The mode is selected automatically from which variables are set:
 
