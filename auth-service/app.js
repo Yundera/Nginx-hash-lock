@@ -972,6 +972,52 @@ async function bootstrapOauthProvider() {
         console.error('[Auth Service] oidc server_error:', err && err.stack || err);
     });
 
+    // Honour offline_access even when the client omits prompt=consent.
+    //
+    // OIDC Core 11.1 says an authorization server MUST ignore the offline_access
+    // scope unless the request also carries prompt=consent, and oidc-provider
+    // implements that literally: it silently drops the scope. The default
+    // issueRefreshToken policy then sees no offline_access in the granted scopes
+    // and issues no refresh token, so the client is left with a 1-hour access
+    // token and no way to renew it — it has to send the user back through a full
+    // login every hour.
+    //
+    // Clients that derive their scopes from the protected resource metadata
+    // (RFC 9728, advertised below) hit this constantly: they request
+    // offline_access because the resource advertises it, but send no prompt
+    // parameter. Verified against this server — the same authorization request
+    // with prompt=consent added returns a refresh token, without it does not.
+    //
+    // Adding the prompt here rather than relaxing issueRefreshToken keeps the
+    // change narrow: only requests that explicitly asked for offline access are
+    // touched, the grant genuinely contains the scope, and clients that never
+    // asked still get no refresh token. No user decision is bypassed either —
+    // consent is auto-granted first-party in the interaction handler below, so
+    // prompt=consent costs one extra redirect and shows nothing.
+    // Mounted at the root on purpose: Express restores req.url when a middleware
+    // mounted on a sub-path returns, which would silently undo the rewrite below.
+    const AUTHORIZATION_PATH = '/AppShield/oidc/auth';
+    app.use((req, res, next) => {
+        if (req.path !== AUTHORIZATION_PATH) return next();
+        // Only the browser-facing GET carries the parameters in the query string.
+        // A POST authorization request (rare) and pushed authorization requests
+        // (/AppShield/oidc/request) carry them in a body that is deliberately not
+        // parsed for provider paths, so they are left alone; a client using those
+        // must send prompt=consent itself.
+        if (req.method !== 'GET') return next();
+        const scopes = String(req.query.scope || '').split(' ');
+        if (!scopes.includes('offline_access') || req.query.prompt) return next();
+        try {
+            const url = new URL(req.originalUrl, OAUTH_ISSUER);
+            url.searchParams.set('prompt', 'consent');
+            req.url = url.pathname + url.search;
+            console.log('[Auth Service] added prompt=consent for offline_access request');
+        } catch (err) {
+            console.log(`[Auth Service] could not add prompt=consent: ${err.message}`);
+        }
+        return next();
+    });
+
     // Route provider-owned paths to oidc-provider; everything else falls through.
     app.use((req, res, next) => {
         if (!oauthProviderCallback) return next();
@@ -994,14 +1040,13 @@ async function bootstrapOauthProvider() {
             resource: OAUTH_RESOURCE,
             authorization_servers: [OAUTH_ISSUER],
             bearer_methods_supported: ['header'],
-            // offline_access is advertised on purpose. Per the MCP spec's scope
-            // selection strategy, a client takes its scopes from here (or from
-            // the WWW-Authenticate challenge) and asks for nothing else — so
-            // without it, no client ever requests offline access, oidc-provider
-            // issues no refresh token, and every consumer has to be
-            // re-authorized by a human once the 1h access token expires. That is
-            // merely annoying for a browser client like claude.ai; it makes
-            // unattended clients (a Beacon aggregating this endpoint) unusable.
+            // offline_access is advertised on purpose. A client that derives its
+            // scopes from this document (or from the WWW-Authenticate challenge)
+            // asks for nothing else — so without it listed here, nothing ever
+            // requests offline access, oidc-provider issues no refresh token, and
+            // every consumer has to be re-authorized by a human once the 1h
+            // access token expires. Merely annoying for an interactive browser
+            // client; it makes unattended clients unusable.
             scopes_supported: [OAUTH_SCOPE, 'offline_access'],
         });
     });
