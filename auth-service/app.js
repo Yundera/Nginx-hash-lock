@@ -1198,10 +1198,19 @@ async function verifyControlToken(req) {
  *   { "sub": "<idp subject>" }   every session for that subject
  *   { "user": "<username>" }     every session for that preferred_username
  *   { "all": true }              every session on this gate
+ * and optionally:
+ *   { "except": "<sessionId>" }  spare these (string or array of strings)
  *
  * `sub` and `user` may be combined; a session matching either is revoked, which
  * is what you want when an account is renamed and old sessions still carry the
  * previous username.
+ *
+ * `except` exists for the self-service case: an operator resetting their OWN
+ * password must invalidate every session opened with the old one WITHOUT
+ * logging themselves out of the page they are doing it from — the backend has
+ * the browser's cookie (nginx forwards it), so it can name the one session to
+ * keep. Without this the most common password reset on a single-account box
+ * would always end in a bounce to the login screen.
  *
  * Idempotent by construction: revoking something already gone returns
  * {revoked: 0}, not an error. Deleting through the `sessions` Proxy persists to
@@ -1220,10 +1229,13 @@ app.post('/nhl-auth/sessions/revoke', async (req, res) => {
     const token = await verifyControlToken(req);
     if (!token) return res.status(401).json({ error: 'invalid or missing control token' });
 
-    const { sub, user, all } = req.body || {};
+    const { sub, user, all, except } = req.body || {};
     if (!sub && !user && all !== true) {
         return res.status(400).json({ error: 'specify at least one of: sub, user, all' });
     }
+    const spared = new Set(
+        (Array.isArray(except) ? except : except ? [except] : []).map(String)
+    );
 
     const matches = (session) => {
         if (all === true) return true;
@@ -1234,13 +1246,15 @@ app.post('/nhl-auth/sessions/revoke', async (req, res) => {
 
     let revoked = 0;
     for (const [sessionId, session] of Object.entries(sessions)) {
+        if (spared.has(sessionId)) continue;
         if (matches(session)) {
             delete sessions[sessionId];
             revoked++;
         }
     }
 
-    const what = all === true ? 'all sessions' : `sub=${sub || '-'} user=${user || '-'}`;
+    const what = (all === true ? 'all sessions' : `sub=${sub || '-'} user=${user || '-'}`) +
+        (spared.size ? ` except ${spared.size} session(s)` : '');
     console.log(`[Auth Service] Revoked ${revoked} session(s) (${what}) on behalf of ${token.sub || CONTROL_ISSUER}`);
     return res.status(200).json({ revoked });
 });

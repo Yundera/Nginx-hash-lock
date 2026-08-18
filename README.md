@@ -252,8 +252,15 @@ Content-Type: application/json
 {"user": "alice"}      every session for that preferred_username
 {"sub": "CgVhbGljZQ"}  every session for that IdP subject
 {"all": true}          every session on this gate
+
+{"user": "alice", "except": "<sessionId>"}   ... but spare these
 → 200 {"revoked": 2}
 ```
+
+`except` (string or array) is for the self-service case: an operator resetting their **own**
+password must end every session opened with the old password without logging themselves out
+of the page they are doing it from. The backend receives the browser's `appshield_session`
+cookie (nginx forwards it), so it can name the one session to keep.
 
 `sub` and `user` can be combined (a session matching either is revoked — what you want when
 an account was renamed and older sessions still carry the previous username). Revoking
