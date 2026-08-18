@@ -163,6 +163,11 @@ The boundary this changes:
   must verify the signed assertion rather than read the plain headers.
 - `OIDC_REQUIRED_GROUPS` moves a first slice of *authorization* into the gate. It applies
   to interactive OIDC identities only; hash and OAuth callers are unaffected by design.
+- `POST /nhl-auth/sessions/revoke` (enabled by `IDENTITY_ASSERTION_SECRET`) lets the backend
+  end sessions it has invalidated — the gate-side equivalent of settings-center-app's
+  per-account session epoch. Authorized by an HS256 control token on `aud=appshield-control`,
+  deliberately a different audience from the identity assertions the gate hands out on every
+  request, so a leaked assertion is not a revocation credential.
 
 ## Integration checklist for a new app
 

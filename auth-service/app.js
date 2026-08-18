@@ -220,6 +220,30 @@ let OAUTH_ISSUER = null;           // single fixed issuer origin
 const pendingOidcFlows = new Map();
 const OIDC_FLOW_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * Cookie attributes for the gate session.
+ *
+ * `Secure` is derived from how the request actually arrived rather than hardcoded
+ * either way. It used to be `secure: false` unconditionally, which on an
+ * HTTPS-only host (every PCS app is behind Caddy TLS) let the session cookie be
+ * sent over plaintext if anything ever downgraded the connection — and matters
+ * more now that a gate can front a privileged app. Hardcoding it to `true` is
+ * not an option either: a gate reached over plain HTTP would set a cookie the
+ * browser refuses to send back, i.e. an unbreakable login loop.
+ *
+ * Express derives req.protocol from X-Forwarded-Proto because `trust proxy` is
+ * on (see app.set above). Caddy sets that header; when nothing does, the value
+ * is `http` and the cookie stays non-Secure, which is the old behaviour.
+ */
+function sessionCookieOptions(req) {
+    return {
+        httpOnly: true,
+        secure: req.protocol === 'https',
+        maxAge: SESSION_DURATION_MS,
+        sameSite: 'lax',
+    };
+}
+
 // Generate secure random session ID
 function generateSessionId() {
     return crypto.randomBytes(32).toString('hex');
@@ -736,12 +760,7 @@ app.post('/nhl-auth/login', async (req, res) => {
         console.log(`[Auth Service] Session created: ${sessionId.substring(0, 8)}... (expires in ${SESSION_DURATION_HOURS}h)`);
 
         // Set cookie and redirect
-        res.cookie('appshield_session', sessionId, {
-            httpOnly: true,
-            secure: false, // Set to true if using HTTPS
-            maxAge: SESSION_DURATION_MS,
-            sameSite: 'lax'
-        });
+        res.cookie('appshield_session', sessionId, sessionCookieOptions(req));
 
         res.redirect(redirect || '/');
     } else {
@@ -816,12 +835,7 @@ app.get('/nhl-auth/check', async (req, res) => {
                 console.log(`[Auth Service] Session created for hash auth: ${sessionId.substring(0, 8)}... (expires in ${SESSION_DURATION_HOURS}h)`);
 
                 // Set session cookie
-                res.cookie('appshield_session', sessionId, {
-                    httpOnly: true,
-                    secure: false,
-                    maxAge: SESSION_DURATION_MS,
-                    sameSite: 'lax'
-                });
+                res.cookie('appshield_session', sessionId, sessionCookieOptions(req));
             }
 
             return await authOk(req, res, { method: 'hash', sub: '', user: '', email: '', name: '', groups: [] });
@@ -966,12 +980,7 @@ app.get('/nhl-auth/establish-session', (req, res) => {
             console.log(`[Auth Service] Session established via hash: ${sessionId.substring(0, 8)}... (expires in ${SESSION_DURATION_HOURS}h)`);
 
             // Set session cookie
-            res.cookie('appshield_session', sessionId, {
-                httpOnly: true,
-                secure: false,
-                maxAge: SESSION_DURATION_MS,
-                sameSite: 'lax'
-            });
+            res.cookie('appshield_session', sessionId, sessionCookieOptions(req));
 
             // Redirect back if requested
             if (req.query.return_to) {
@@ -1078,12 +1087,7 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
         };
         console.log(`[Auth Service] OIDC session created for sub=${claims.sub} user=${identityClaims.user || '(none)'} groups=[${identityClaims.groups.join(',')}] (${sessionId.substring(0, 8)}...)`);
 
-        res.cookie('appshield_session', sessionId, {
-            httpOnly: true,
-            secure: false,
-            maxAge: SESSION_DURATION_MS,
-            sameSite: 'lax',
-        });
+        res.cookie('appshield_session', sessionId, sessionCookieOptions(req));
         res.redirect(flow.originalUri || '/');
     } catch (err) {
         console.error('[Auth Service] OIDC callback failed:', err);
@@ -1104,7 +1108,7 @@ app.all('/nhl-auth/logout', (req, res) => {
         delete sessions[sessionId];
         console.log(`[Auth Service] Session destroyed on logout (${sessionId.substring(0, 8)}...)`);
     }
-    res.clearCookie('appshield_session');
+    res.clearCookie('appshield_session', {httpOnly: true, secure: req.protocol === 'https', sameSite: 'lax'});
     res.status(200).type('html').send(
         '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Signed out</title>' +
         '<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;' +
@@ -1116,6 +1120,129 @@ app.all('/nhl-auth/logout', (req, res) => {
         'identity provider; signing in again may not ask for your password.</p>' +
         '</div></body></html>'
     );
+});
+
+// ===========================================================================
+// Control API: session revocation
+//
+// WHY THIS EXISTS. A gate session is a bearer credential valid for its full TTL
+// (30 days by default) and nothing outside the gate could end one. That is fine
+// for a media app and wrong for a privileged one: an app that can delete an
+// account, reset its password or strip its admin rights needs those actions to
+// take effect on sessions already in flight, not just on the next login.
+// settings-center-app solves it today with a per-account session epoch stamped
+// into its own JWT; a gate-issued session has no such handle, so the gate has to
+// offer one.
+//
+// AUTHENTICATION. The endpoint is reachable from the internet (everything under
+// /nhl-auth/ is), so it is gated on a signed control token rather than on where
+// the request came from — nginx proxies it from 127.0.0.1, which makes network
+// origin unusable as a check. The token is an HS256 JWT signed with
+// IDENTITY_ASSERTION_SECRET: the same secret the backend already needs in order
+// to verify identity assertions, used in the other direction. No second secret
+// to provision, and a gate without that secret has no control API at all.
+//
+// AUDIENCE SEPARATION IS THE POINT. Identity assertions carry aud=APP_NAME;
+// control tokens carry aud="appshield-control". Without that split, an identity
+// assertion — which the gate hands to the backend on every request, and which a
+// backend may well log — would double as a session-revocation credential.
+// ===========================================================================
+const CONTROL_AUDIENCE = 'appshield-control';
+const CONTROL_ISSUER = 'appshield-backend';
+const CONTROL_MAX_TOKEN_LIFETIME_SECONDS = 300;
+
+/** Verify a control token. Returns its payload, or null (having logged why). */
+async function verifyControlToken(req) {
+    const header = req.headers['authorization'] || '';
+    const m = /^Bearer\s+(.+)$/i.exec(header);
+    if (!m) {
+        console.log('[Auth Service] Control call rejected: no Bearer token');
+        return null;
+    }
+    try {
+        const jose = await loadJose();
+        const key = new TextEncoder().encode(IDENTITY_ASSERTION_SECRET);
+        const { payload, protectedHeader } = await jose.jwtVerify(m[1], key, {
+            issuer: CONTROL_ISSUER,
+            audience: CONTROL_AUDIENCE,
+        });
+        // The key is symmetric, so jose can only have accepted an HMAC alg — this
+        // is belt-and-braces against a future change to how the key is built.
+        if (protectedHeader.alg !== 'HS256') {
+            console.log(`[Auth Service] Control call rejected: unexpected alg ${protectedHeader.alg}`);
+            return null;
+        }
+        // Bound the replay window. jose already enforces exp; this additionally
+        // refuses a token minted with a year-long lifetime, which would be a
+        // standing credential rather than a one-shot authorisation.
+        if (typeof payload.iat !== 'number' || typeof payload.exp !== 'number') {
+            console.log('[Auth Service] Control call rejected: token missing iat/exp');
+            return null;
+        }
+        if (payload.exp - payload.iat > CONTROL_MAX_TOKEN_LIFETIME_SECONDS) {
+            console.log('[Auth Service] Control call rejected: token lifetime exceeds ' +
+                `${CONTROL_MAX_TOKEN_LIFETIME_SECONDS}s`);
+            return null;
+        }
+        return payload;
+    } catch (err) {
+        console.log(`[Auth Service] Control call rejected: ${err.message}`);
+        return null;
+    }
+}
+
+/**
+ * POST /nhl-auth/sessions/revoke
+ *
+ * Body selects what to end — at least one of:
+ *   { "sub": "<idp subject>" }   every session for that subject
+ *   { "user": "<username>" }     every session for that preferred_username
+ *   { "all": true }              every session on this gate
+ *
+ * `sub` and `user` may be combined; a session matching either is revoked, which
+ * is what you want when an account is renamed and old sessions still carry the
+ * previous username.
+ *
+ * Idempotent by construction: revoking something already gone returns
+ * {revoked: 0}, not an error. Deleting through the `sessions` Proxy persists to
+ * SESSIONS_FILE, so a revocation survives a gate restart rather than coming back
+ * with the restored session set.
+ */
+app.post('/nhl-auth/sessions/revoke', async (req, res) => {
+    if (!IDENTITY_ASSERTION_SECRET) {
+        // Not an error the caller can fix by retrying — say so plainly rather
+        // than 401, which would look like a bad token.
+        return res.status(501).json({
+            error: 'control API disabled: IDENTITY_ASSERTION_SECRET is not configured on this gate',
+        });
+    }
+
+    const token = await verifyControlToken(req);
+    if (!token) return res.status(401).json({ error: 'invalid or missing control token' });
+
+    const { sub, user, all } = req.body || {};
+    if (!sub && !user && all !== true) {
+        return res.status(400).json({ error: 'specify at least one of: sub, user, all' });
+    }
+
+    const matches = (session) => {
+        if (all === true) return true;
+        if (sub && (session.claims?.sub === sub || session.oidcSub === sub)) return true;
+        if (user && session.claims?.user === user) return true;
+        return false;
+    };
+
+    let revoked = 0;
+    for (const [sessionId, session] of Object.entries(sessions)) {
+        if (matches(session)) {
+            delete sessions[sessionId];
+            revoked++;
+        }
+    }
+
+    const what = all === true ? 'all sessions' : `sub=${sub || '-'} user=${user || '-'}`;
+    console.log(`[Auth Service] Revoked ${revoked} session(s) (${what}) on behalf of ${token.sub || CONTROL_ISSUER}`);
+    return res.status(200).json({ revoked });
 });
 
 // Health check
@@ -1554,6 +1681,7 @@ app.listen(PORT, () => {
     console.log(`[Auth Service] Identity headers: ${IDENTITY_HEADERS ? 'on' : 'off'}` +
         (IDENTITY_HEADERS ? ` (assertion: ${IDENTITY_ASSERTION_SECRET ? `signed, ${IDENTITY_ASSERTION_TTL_SECONDS}s` : 'unsigned headers only'})` : ''));
     console.log(`[Auth Service] Required groups: ${REQUIRED_GROUPS.length ? REQUIRED_GROUPS.join(',') : '(none — any authenticated identity)'}`);
+    console.log(`[Auth Service] Control API (session revocation): ${IDENTITY_ASSERTION_SECRET ? 'enabled' : 'disabled (no IDENTITY_ASSERTION_SECRET)'}`);
     if (IDENTITY_ASSERTION_SECRET && !IDENTITY_HEADERS) {
         console.warn('[Auth Service] WARNING: IDENTITY_ASSERTION_SECRET is set but IDENTITY_HEADERS is off — no identity is forwarded.');
     }

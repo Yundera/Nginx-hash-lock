@@ -233,6 +233,57 @@ Machine auth (`hash`, `oauth`) is exempt — it carries no groups, and gating it
 silently cut off API access the moment an app adopted group enforcement. Use a separate
 gate, or omit `AUTH_HASH`, if machines must be excluded too.
 
+### Revoking sessions (control API)
+
+A gate session is a bearer credential good for its whole TTL — 30 days by default — and
+until now nothing outside the gate could end one early. That is fine for a media app and
+wrong for a privileged one: deleting an account, resetting its password or removing its
+admin rights must take effect on sessions **already in flight**, not just on the next login.
+
+`POST /nhl-auth/sessions/revoke` does that. It is enabled exactly when
+`IDENTITY_ASSERTION_SECRET` is set (a gate without that secret answers `501` and has no
+control surface at all).
+
+```
+POST /nhl-auth/sessions/revoke
+Authorization: Bearer <control token>
+Content-Type: application/json
+
+{"user": "alice"}      every session for that preferred_username
+{"sub": "CgVhbGljZQ"}  every session for that IdP subject
+{"all": true}          every session on this gate
+→ 200 {"revoked": 2}
+```
+
+`sub` and `user` can be combined (a session matching either is revoked — what you want when
+an account was renamed and older sessions still carry the previous username). Revoking
+something already gone is `{"revoked": 0}`, not an error. Deletions persist to
+`SESSIONS_FILE`, so a revocation is not undone by a gate restart.
+
+**The control token** is an HS256 JWT signed with `IDENTITY_ASSERTION_SECRET` — the same
+secret the backend already needs in order to verify identity assertions, used in the other
+direction, so there is no second secret to provision:
+
+```
+alg  HS256, signed with IDENTITY_ASSERTION_SECRET
+iss  appshield-backend
+aud  appshield-control      ← NOT the app name
+sub  free-form caller label (logged)
+iat  required
+exp  required, and at most 300s after iat
+```
+
+**Why the audience is different from the identity assertion's.** Identity assertions carry
+`aud: APP_NAME` and are handed to the backend on every single request — where they may well
+end up in a log. If control tokens shared that audience, every one of those assertions would
+double as a session-revocation credential. The split is what keeps a leaked assertion
+useless here, and the ≤300s lifetime cap is what stops a control token from becoming a
+standing credential.
+
+Everything under `/nhl-auth/` is reachable from the internet, and nginx proxies this endpoint
+from `127.0.0.1`, so network origin cannot be used as a check — the token is the whole
+authorization. Treat `IDENTITY_ASSERTION_SECRET` accordingly.
+
 ### Signing out
 
 `GET|POST /nhl-auth/logout` destroys the gate session, clears the cookie, and renders a
@@ -729,6 +780,14 @@ Request → NGINX auth_request to auth service → Check session cookie
 Request matching /[40-hex-chars]/* pattern → Direct proxy to backend (no auth)
 Other requests → Normal authentication flow
 ```
+
+### Session cookie
+
+`appshield_session` is `HttpOnly`, `SameSite=Lax`, and `Secure` **when the request arrived
+over HTTPS** (derived from `X-Forwarded-Proto`, which Caddy sets). It is not hardcoded
+either way on purpose: always-off would let the cookie travel in plaintext on an HTTPS-only
+host, and always-on would make a gate reached over plain HTTP set a cookie the browser
+refuses to send back — an unbreakable login loop.
 
 ### Session Management
 - Sessions stored in-memory (Node.js auth service)
