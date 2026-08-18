@@ -319,12 +319,25 @@ x-casaos:
 
 **What happens at first user hit:**
 1. User hits `https://myapp-alice.example.com/` → nginx runs `auth_request` → 401 (no cookie).
-2. Nginx redirects to `/nhl-auth/oidc/login`, which POSTs to `$OIDC_REGISTRAR_URL/register` (e.g. `http://auth-registrar:9092/register`) with its callback URL.
-3. The registrar identifies the caller as container `myapp` via PTR on the pcs network, registers an OIDC client with the SSO provider, and returns `{client_id, client_secret, issuer_url}`.
-4. The sidecar initializes `openid-client`, kicks off authorization_code + PKCE (S256), and redirects the browser to the SSO provider's `/authorize`.
-5. The user logs in with the SSO provider → bounced back to `/nhl-auth/oidc/callback` → session cookie set → redirected to the original URL.
+2. Nginx redirects to `/nhl-auth/oidc/login`, which POSTs to `$OIDC_REGISTRAR_URL/register` (e.g. `http://auth-registrar:9092/register`) with its callback **path**.
+3. The registrar identifies the caller as container `myapp` via PTR on the pcs network, registers an OIDC client with the SSO provider, and returns `{client_id, client_secret, issuer_url, redirect_uris}`.
+4. The sidecar adopts the returned `redirect_uris` as its public host set, initializes `openid-client`, kicks off authorization_code + PKCE (S256), and redirects the browser to the SSO provider's `/authorize`.
+5. The user logs in with the SSO provider → bounced back to `/nhl-auth/oidc/callback` **on the host the login started from** → session cookie set → redirected to the original URL.
 
 Subsequent boots: the registrar is idempotent — the same client and secret come back, so the OIDC client is reused.
+
+### Who decides which hostnames are ours
+
+The registrar does. AppShield sends only its callback *path* and uses the `redirect_uris` that come back.
+
+This matters because the host set is a property of the deployment, not of the app. `REDIRECT_HOST_SUFFIXES` lets the sidecar guess `<app>-<suffix>`, but the PCS **root domain** breaks that rule: whichever app the root domain proxies to is also served at the bare suffix (`example.com`, not just `myapp-example.com`), and nothing an app knows about itself reveals that. An app computing its own list therefore has no registrable callback on the bare domain, so a login starting there gets bounced to `myapp-example.com` mid-flow — which users report as "SSO sent me to a different URL". Letting the registrar answer fixes it for every app at once, including store apps whose compose nobody templates.
+
+`REDIRECT_HOST_SUFFIXES` is still honoured as the pre-registration guess, as the fallback when `/register` is unreachable, and as what gets sent to registrars older than mesh-auth 1.2.0 (which require `redirect_uris` and ignore `callback_path`). Both fields are sent, so the sidecar works against either.
+
+Two things stay locally computed on purpose:
+
+- **The canonical origin** (`<app>-<first suffix>`) is never re-derived from the registrar's list. With `OAUTH_RESOURCE` set it becomes the OAuth issuer, which is baked into already-issued tokens and into discovery documents remote clients cache — moving it would invalidate all of them.
+- **Session cookies stay host-scoped.** Logging in on the bare domain and on `myapp-example.com` yields two independent sessions. That was already true across the nip.io/sslip.io hosts; this change stops the host from *switching* mid-login, it does not merge sessions across hosts.
 
 ## How It Works
 

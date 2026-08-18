@@ -48,12 +48,20 @@ const OAUTH_DATA_DIR = process.env.OAUTH_DATA_DIR || '/data/oauth';
 // redirect_uri matching the host the user actually arrived on — login on
 // <app>-<suffixA> returns there, login on <app>-<suffixB> returns there.
 //
-// The host set is `<app>-<suffix>` for each suffix in REDIRECT_HOST_SUFFIXES
-// (comma-separated). The code knows NOTHING about specific domains or DNS
-// providers — the suffix list is pure config, supplied by the app's compose the
-// same way the caddy_* labels are. Keep the `<app>-<suffix>` join in sync with
-// the Caddy labels and the mesh-router-auth registrar. When the list is unset we
-// fall back to the legacy single request-Host behaviour.
+// THE REGISTRAR OWNS THIS SET. Which hostnames an app answers on is a property
+// of the deployment — which suffixes exist, and which app the PCS root domain
+// reverse-proxies to — not something an app can derive from its own name. The
+// root domain is the case that proves it: whoever it points at is *also* served
+// at the bare suffix (`example.com`, not just `<app>-example.com`), and no
+// amount of local computation can discover that. So /register returns the
+// authoritative redirect_uris and we adopt them (see adoptRegisteredCallbacks).
+//
+// What follows is only a SEED: our best guess at our own hosts, used to talk to
+// registrars too old to answer with a list, and as the fallback if /register
+// never succeeds. The `<app>-<suffix>` join is the mesh-router subdomain
+// convention; the suffix list is pure config, supplied by the app's compose the
+// same way the caddy_* labels are. When the list is unset we fall back to the
+// legacy single request-Host behaviour.
 const APP_NAME = (process.env.APP_NAME || os.hostname() || '').toLowerCase();
 const REDIRECT_HOST_SUFFIXES = (process.env.REDIRECT_HOST_SUFFIXES || '')
     .split(',')
@@ -66,11 +74,22 @@ function computeAppHosts(appName) {
 }
 
 const APP_HOSTS = APP_NAME ? computeAppHosts(APP_NAME) : [];
-const ALLOWED_ORIGINS = new Set(APP_HOSTS.map((h) => `https://${h}`));
-// Preferred origin when a request arrives on a host we don't recognise.
+// Mutable: replaced wholesale by the registrar's list on first registration.
+let allowedOrigins = new Set(APP_HOSTS.map((h) => `https://${h}`));
+// PINNED to our own first host, and deliberately NOT re-derived from whatever
+// the registrar returns. When OAUTH_RESOURCE is set this value becomes
+// OAUTH_ISSUER (see bootstrapOauthProvider) — the issuer baked into every token
+// we have already signed and into the discovery documents remote clients cache.
+// Moving it would invalidate all of them. It is also read at boot, before any
+// /register call has happened, so it cannot depend on one.
 const CANONICAL_ORIGIN = APP_HOSTS.length ? `https://${APP_HOSTS[0]}` : null;
+// Where to send a request that arrives on a host we don't recognise. Starts as
+// the canonical origin and is only ever FILLED IN from the registrar's list when
+// we had no host config at all — it never overrides CANONICAL_ORIGIN, so the
+// OAuth issuer above stays put.
+let fallbackOrigin = CANONICAL_ORIGIN;
 if (OIDC_ENABLED) {
-    console.log(`[Auth Service] app=${APP_NAME} public hosts: ${APP_HOSTS.join(', ') || '(none — falling back to request Host)'}`);
+    console.log(`[Auth Service] app=${APP_NAME} public hosts (guess, pending registration): ${APP_HOSTS.join(', ') || '(none — falling back to request Host)'}`);
 }
 
 // Generate password hash for session validation
@@ -196,36 +215,88 @@ function getPublicOrigin(req) {
 
 // Pick the callback URL for the host the request arrived on. Falls back to the
 // canonical host for an unrecognised host, and to the raw request origin when no
-// host set was configured (legacy single-host behaviour).
+// host set is known at all (legacy single-host behaviour).
 function chosenRedirect(req) {
     const origin = getPublicOrigin(req);
-    const base = ALLOWED_ORIGINS.has(origin) ? origin : (CANONICAL_ORIGIN || origin);
+    const base = allowedOrigins.has(origin) ? origin : (fallbackOrigin || origin);
     return `${base}${CALLBACK_PATH}`;
 }
 
-async function getOrInitOidcClient(publicOrigin) {
-    if (oidcClient) return oidcClient;
+// Replace our guessed host set with the registrar's authoritative one. This is
+// what lets a login that started on the bare root domain finish there instead of
+// being bounced to <app>-<suffix>: that host is in the registrar's list and can
+// never be in ours.
+function adoptRegisteredCallbacks(callbacks) {
+    const origins = new Set();
+    for (const uri of callbacks) {
+        try {
+            origins.add(new URL(uri).origin);
+        } catch {
+            console.warn(`[Auth Service] Ignoring unparseable registered redirect_uri: ${uri}`);
+        }
+    }
+    if (origins.size === 0) return;
 
-    // Register a callback for EVERY host AppShield is reachable under, so any of
-    // them is an accepted redirect_uri (the registrar verifies each against its
-    // own recomputed allowlist). Falls back to the single request origin when no
-    // host set is configured (REDIRECT_HOST_SUFFIXES not injected).
-    const callbacks = ALLOWED_ORIGINS.size > 0
-        ? [...ALLOWED_ORIGINS].map((o) => `${o}${CALLBACK_PATH}`)
+    const added = [...origins].filter((o) => !allowedOrigins.has(o));
+    const dropped = [...allowedOrigins].filter((o) => !origins.has(o));
+    allowedOrigins = origins;
+    // Only fills a hole; never moves a canonical origin we already published.
+    if (!fallbackOrigin) fallbackOrigin = [...origins][0];
+
+    if (added.length) console.log(`[Auth Service] Registrar added host(s): ${added.join(', ')}`);
+    // Not an error — it means the deployment no longer routes those hosts to us
+    // (e.g. this app stopped being the root app). Worth seeing, because sessions
+    // held on a dropped origin will stop being accepted.
+    if (dropped.length) console.log(`[Auth Service] Registrar dropped host(s): ${dropped.join(', ')}`);
+}
+
+// Memoised so that two parallel first-logins (or a /login and its /callback)
+// don't each POST /register. A failure clears the memo so the next request
+// retries rather than inheriting a dead promise.
+let oidcClientPromise = null;
+function getOrInitOidcClient(publicOrigin) {
+    if (oidcClient) return Promise.resolve(oidcClient);
+    if (!oidcClientPromise) {
+        oidcClientPromise = initOidcClient(publicOrigin).catch((err) => {
+            oidcClientPromise = null;
+            throw err;
+        });
+    }
+    return oidcClientPromise;
+}
+
+async function initOidcClient(publicOrigin) {
+    // Our own guess at the host set. Sent alongside callback_path so that a
+    // registrar predating the callback_path contract — which requires a non-empty
+    // redirect_uris and ignores anything else — still answers. A registrar that
+    // understands callback_path ignores this in turn and derives the real list.
+    // Drop this field once every PCS is on mesh-auth >= 1.2.0.
+    const guessedCallbacks = allowedOrigins.size > 0
+        ? [...allowedOrigins].map((o) => `${o}${CALLBACK_PATH}`)
         : [`${publicOrigin}${CALLBACK_PATH}`];
-    console.log(`[Auth Service] Registering OIDC client with ${OIDC_REGISTRAR_URL} (callbacks=${callbacks.join(', ')})`);
+    console.log(`[Auth Service] Registering OIDC client with ${OIDC_REGISTRAR_URL} (callback_path=${CALLBACK_PATH}, guess=${guessedCallbacks.join(', ')})`);
 
     const response = await fetch(`${OIDC_REGISTRAR_URL}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ redirect_uris: callbacks }),
+        body: JSON.stringify({ callback_path: CALLBACK_PATH, redirect_uris: guessedCallbacks }),
     });
     if (!response.ok) {
         const body = await response.text();
         throw new Error(`Registrar returned ${response.status}: ${body}`);
     }
-    const { client_id, client_secret, issuer_url } = await response.json();
-    console.log(`[Auth Service] Registered OIDC client_id=${client_id} issuer=${issuer_url}`);
+    const { client_id, client_secret, issuer_url, redirect_uris } = await response.json();
+
+    // Use what came back, not what we guessed. An older registrar omits the
+    // field entirely, in which case our guess is exactly what it registered.
+    const callbacks = Array.isArray(redirect_uris) && redirect_uris.length > 0
+        ? redirect_uris
+        : guessedCallbacks;
+    if (!Array.isArray(redirect_uris)) {
+        console.log('[Auth Service] Registrar returned no redirect_uris (pre-1.2.0); keeping locally computed host set');
+    }
+    adoptRegisteredCallbacks(callbacks);
+    console.log(`[Auth Service] Registered OIDC client_id=${client_id} issuer=${issuer_url} callbacks=${callbacks.join(', ')}`);
 
     const issuer = await Issuer.discover(issuer_url);
     oidcClient = new issuer.Client({
