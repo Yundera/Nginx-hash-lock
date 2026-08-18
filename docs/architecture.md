@@ -140,6 +140,30 @@ sequenceDiagram
 
 Redirect URI validation is the second line of defense if attestation is ever wrong: the registrar requires the first DNS label of every `redirect_uri` to equal the attested `client_id` or start with `client_id-`. See [mesh-router-auth/src/validation.ts](../../yundera-root/packages/mesh-router-root/mesh-router-auth/src/validation.ts) — the tests cover the typosquat cases (`myapp2.*` rejected).
 
+## Identity propagation (IDENTITY_HEADERS)
+
+The gate forwards the authenticated identity to the backend under the conventional
+forward-auth names (`Remote-User`/`-Name`/`-Email`/`-Groups`, plus the `X-Forwarded-*` and
+`X-Auth-Request-*` aliases), and optionally as `X-AppShield-Assertion`, a per-request HS256
+JWT signed with a secret shared between gate and backend. On by default; `IDENTITY_HEADERS:
+"off"` disables forwarding. Full contract in [../README.md](../README.md#identity-propagation).
+
+The boundary this changes:
+
+- nginx overwrites the entire identity header set on **every** proxied location — the
+  authenticated one, the `ALLOWED_PATHS` / `ALLOWED_EXTENSIONS` bypasses, the hash-content
+  path, and the OAuth resource path. A client-supplied `Remote-User` therefore never reaches
+  a backend, on any path, with the feature on or off. This matters more now that the names
+  are the conventional ones: an app configured for proxy auth will act on them.
+- That guarantee stops at the gate's own socket. Boundary 3 below says backends are
+  "firewalled behind their sidecar **at the routing layer**" — Caddy will not route to
+  them, but every container on `pcs` can still dial them directly. Plain headers are
+  consequently only sound for apps where reaching the backend directly is not a meaningful
+  escalation. Where it is — an app that can reboot the box or open a shell — the backend
+  must verify the signed assertion rather than read the plain headers.
+- `OIDC_REQUIRED_GROUPS` moves a first slice of *authorization* into the gate. It applies
+  to interactive OIDC identities only; hash and OAuth callers are unaffected by design.
+
 ## Integration checklist for a new app
 
 To opt an app into OIDC auth:
@@ -154,5 +178,6 @@ See the "OIDC via Yundera Authelia" example in [../README.md](../README.md) for 
 
 - **OIDC mode currently supersedes** hash and credentials modes. Mixing (e.g. "hash-param for dashboard quick-access, OIDC for real users") is on the roadmap but not implemented.
 - **Redirect URI updates** are not handled by the underlying `register-oidc-client.sh` script — an app that changes its canonical hostname requires manual cleanup of `clients.d/<id>.{yml,secret}` before the next registration. Tracked for a `--force` patch in template-root.
-- **Session persistence** is in-memory. A restart of the hash-lock container logs everyone out of that app; Authelia's own session is unaffected, so re-login is transparent as long as the Authelia session is still valid.
+- ~~**Session persistence** is in-memory.~~ Fixed in 2.0.6: sessions are written through to `SESSIONS_FILE` (default `/data/sessions.json`) and survive container recreates when `/data` is mounted.
+- **Identity is forwarded, not enforced end-to-end.** The gate tells the backend who the caller is; nothing stops a *different* container on `pcs` from talking to that backend directly. The signed assertion makes such a forgery detectable, but only for backends that actually verify it.
 - **Container name is the OIDC client id**, which means re-deploying an app under a different container name creates an orphan OIDC client entry. De-registration on uninstall is a nice-to-have not yet wired up.

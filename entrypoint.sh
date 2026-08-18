@@ -289,6 +289,101 @@ case "$AUTH_MODE" in
         ;;
 esac
 
+
+# ---------------------------------------------------------------------------
+# Identity propagation (IDENTITY_HEADERS, default on)
+#
+# The gate tells the backend who got in, using the header names the
+# forward-auth ecosystem already agreed on — Authelia/Traefik's Remote-*, plus
+# the X-Forwarded-* and X-Auth-Request-* aliases oauth2-proxy popularised. An
+# off-the-shelf app that already supports "authentication by trusted proxy"
+# therefore works behind AppShield with no patch. Only the facts that HAVE no
+# convention (which mechanism authenticated, the IdP subject, our signed
+# assertion) use an X-AppShield-* name.
+#
+# Three files/paths conspire here, and all three must agree:
+#   /tmp/identity_clear.conf    blanks EVERY name we can emit  (always written)
+#   /tmp/identity_forward.conf  forwards them, or blanks them  (always written)
+#   auth_request_set lines      capture the values off the auth subrequest
+#
+# The clear list is the security-critical half, and it must stay a superset of
+# the forward list. These are names real apps act on: an app configured for
+# proxy auth will happily believe a client-supplied `Remote-User: admin`. nginx
+# drops a header whose proxy_set_header value is empty, so "blank" means "not
+# sent" — on every path, bypasses included, whether or not the feature is on.
+# Turning the feature on must not be what makes spoofing possible; turning it
+# off must not leave a hole.
+#
+# The auth_request_set lines can only exist where an auth_request does, so they
+# are appended to the mode's auth block and skipped entirely for AUTH_MODE=none
+# (referencing an unset auth_request variable is a config-time nginx error).
+# ---------------------------------------------------------------------------
+IDENTITY_HEADERS_NORM=$(echo "${IDENTITY_HEADERS:-on}" | tr '[:upper:]' '[:lower:]')
+IDENTITY_FORWARD=1
+case "$IDENTITY_HEADERS_NORM" in
+    off|false|0|no) IDENTITY_FORWARD=0 ;;
+esac
+
+cat > /tmp/identity_clear.conf <<'EOF'
+            proxy_set_header Remote-User "";
+            proxy_set_header Remote-Name "";
+            proxy_set_header Remote-Email "";
+            proxy_set_header Remote-Groups "";
+            proxy_set_header X-Forwarded-User "";
+            proxy_set_header X-Forwarded-Email "";
+            proxy_set_header X-Forwarded-Groups "";
+            proxy_set_header X-Forwarded-Preferred-Username "";
+            proxy_set_header X-Auth-Request-User "";
+            proxy_set_header X-Auth-Request-Email "";
+            proxy_set_header X-Auth-Request-Groups "";
+            proxy_set_header X-Auth-Request-Preferred-Username "";
+            proxy_set_header X-AppShield-Method "";
+            proxy_set_header X-AppShield-Sub "";
+            proxy_set_header X-AppShield-Assertion "";
+EOF
+
+IDENTITY_AUTH_SET=""
+if [ "$IDENTITY_FORWARD" = "1" ] && [ "$AUTH_MODE" != "none" ]; then
+    echo "Identity forwarding ENABLED - backend receives Remote-User / X-Forwarded-User / X-Auth-Request-* / X-AppShield-*"
+    IDENTITY_AUTH_SET="            # Capture the identity the auth service reported for this request
+            auth_request_set \$auth_method \$upstream_http_x_appshield_method;
+            auth_request_set \$auth_sub \$upstream_http_x_appshield_sub;
+            auth_request_set \$auth_user \$upstream_http_x_appshield_user;
+            auth_request_set \$auth_email \$upstream_http_x_appshield_email;
+            auth_request_set \$auth_name \$upstream_http_x_appshield_name;
+            auth_request_set \$auth_groups \$upstream_http_x_appshield_groups;
+            auth_request_set \$auth_assertion \$upstream_http_x_appshield_assertion;"
+    cat > /tmp/identity_forward.conf <<'EOF'
+            # Authelia / Traefik forward-auth convention
+            proxy_set_header Remote-User $auth_user;
+            proxy_set_header Remote-Name $auth_name;
+            proxy_set_header Remote-Email $auth_email;
+            proxy_set_header Remote-Groups $auth_groups;
+            # oauth2-proxy / generic nginx auth_request convention
+            proxy_set_header X-Forwarded-User $auth_user;
+            proxy_set_header X-Forwarded-Email $auth_email;
+            proxy_set_header X-Forwarded-Groups $auth_groups;
+            proxy_set_header X-Forwarded-Preferred-Username $auth_user;
+            proxy_set_header X-Auth-Request-User $auth_user;
+            proxy_set_header X-Auth-Request-Email $auth_email;
+            proxy_set_header X-Auth-Request-Groups $auth_groups;
+            proxy_set_header X-Auth-Request-Preferred-Username $auth_user;
+            # No convention exists for these
+            proxy_set_header X-AppShield-Method $auth_method;
+            proxy_set_header X-AppShield-Sub $auth_sub;
+            proxy_set_header X-AppShield-Assertion $auth_assertion;
+EOF
+    AUTH_CHECK_BLOCK="$AUTH_CHECK_BLOCK
+$IDENTITY_AUTH_SET"
+else
+    if [ "$IDENTITY_FORWARD" = "1" ]; then
+        echo "WARNING: identity forwarding is on but no authentication is configured - nothing to forward, headers will be blanked"
+    else
+        echo "Identity forwarding disabled by IDENTITY_HEADERS=$IDENTITY_HEADERS_NORM - identity headers will be blanked"
+    fi
+    cp /tmp/identity_clear.conf /tmp/identity_forward.conf
+fi
+
 # Prepare authentication block for insertion (deferred until after dynamic paths configuration)
 AUTH_CHECK_ESCAPED=$(echo "$AUTH_CHECK_BLOCK" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/\$/\\$/g' | sed 's/\//\\\//g')
 
@@ -356,6 +451,9 @@ if [ "$ALLOW_HASH_CONTENT_PATHS" = "true" ] || [ "$ALLOW_HASH_CONTENT_PATHS" = "
             # === WebSocket support (uses map for correct behavior) ===
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection \$connection_upgrade;
+
+            # Unauthenticated bypass - no identity, and never the client's.
+            include /tmp/identity_clear.conf;
         }
 EOF
 
@@ -439,6 +537,8 @@ if [ -n "$OAUTH_RESOURCE" ]; then
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection \$connection_upgrade;
             proxy_set_header Authorization \$http_authorization;
+$IDENTITY_AUTH_SET
+            include /tmp/identity_forward.conf;
         }
 EOF
 

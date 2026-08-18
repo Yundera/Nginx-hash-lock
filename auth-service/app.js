@@ -20,6 +20,51 @@ const SESSION_DURATION_MS = SESSION_DURATION_HOURS * 60 * 60 * 1000;
 const OIDC_REGISTRAR_URL = (process.env.OIDC_REGISTRAR_URL || '').replace(/\/+$/, '');
 const OIDC_ENABLED = OIDC_REGISTRAR_URL.length > 0;
 
+// --- Identity propagation (opt-in) -----------------------------------------
+// AppShield authenticates; historically it told the backend NOTHING about who
+// got in — a 200 from /nhl-auth/check and nothing more. That makes the gate
+// unusable for an app whose own authorization depends on the identity (roles,
+// per-user state, an audit trail).
+//
+// The gate forwards the authenticated identity to the backend under the names
+// the forward-auth ecosystem already uses — Remote-User/-Name/-Email/-Groups
+// (Authelia, Traefik) plus the X-Forwarded-* and X-Auth-Request-* aliases
+// (oauth2-proxy) — so an app that already supports proxy auth needs no patch.
+// ON BY DEFAULT; IDENTITY_HEADERS=off opts an app out. nginx OVERWRITES the
+// whole set on every proxied request and blanks it where no identity exists, so
+// a client cannot inject one (see identity_clear.conf / identity_forward.conf in
+// entrypoint.sh) — which is load-bearing precisely because these names are ones
+// real apps act on.
+//
+// TRUST MODEL — read before enabling. Plain headers are only as trustworthy as
+// the network path: on a shared docker network any other container can reach the
+// backend directly and forge them. That is acceptable for an app whose backend
+// is only reachable through the gate; it is NOT acceptable for a privileged app.
+// For those, also set IDENTITY_ASSERTION_SECRET: the gate then adds
+// X-AppShield-Assertion, a short-lived HS256 JWT of the same claims that the backend
+// verifies with the shared secret, making forgery detectable regardless of who
+// can open a socket to it.
+// Default ON: an app behind the gate should be able to know who it is serving
+// without every compose file having to ask. `IDENTITY_HEADERS: "off"` is the
+// escape hatch for an app that must not receive the user's email/name/groups,
+// or one that mis-handles the conventional headers below.
+const IDENTITY_HEADERS = !/^(off|false|0|no)$/i.test((process.env.IDENTITY_HEADERS || 'on').trim());
+const IDENTITY_ASSERTION_SECRET = (process.env.IDENTITY_ASSERTION_SECRET || '').trim();
+const IDENTITY_ASSERTION_TTL_SECONDS = Math.max(
+    5,
+    parseInt(process.env.IDENTITY_ASSERTION_TTL_SECONDS || '60', 10) || 60,
+);
+
+// Groups that an interactive OIDC identity must have at least one of. Empty =
+// authenticate-only, the historical behaviour (any identity the IdP accepts
+// gets in). Machine auth (hash, OAuth Bearer) is NOT subject to this: it
+// carries no groups claim, and gating it here would silently break API access
+// the moment an app adopts group enforcement.
+const REQUIRED_GROUPS = (process.env.OIDC_REQUIRED_GROUPS || '')
+    .split(',')
+    .map((g) => g.trim())
+    .filter(Boolean);
+
 // --- OAuth 2.1 broker (opt-in) ------------------------------------------
 // When OAUTH_RESOURCE is set, AppShield additionally runs an OAuth 2.1 /
 // OIDC Authorization Server (panva oidc-provider) that fronts Dex, so remote
@@ -98,7 +143,13 @@ const PASSWORD_HASH = crypto.createHash('sha256').update(PASSWORD + USERNAME).di
 
 // Session store — a plain object behind a write-through file persistence layer,
 // so gate restarts/recreates no longer log every user out mid-TTL.
-// Format: { sessionId: { expires: timestamp, passwordHash?: string, authHash?: string, oidcSub?: string } }
+// Format: { sessionId: { expires: timestamp, passwordHash?: string, authHash?: string,
+//            oidcSub?: string, claims?: { sub, user, email, name, groups[] } } }
+//
+// `claims` is additive: sessions restored from a file written by an older build
+// simply have none, and degrade to an identity of just the sub (which is what
+// oidcSub already held). Nothing re-reads it for authentication decisions other
+// than group enforcement — it exists to be forwarded.
 //
 // Persisted at SESSIONS_FILE on the same /data volume as OAUTH_DATA_DIR and the
 // managed AUTH_HASH. Without a /data mount the file lands in the container layer
@@ -328,6 +379,186 @@ app.use(skipForProtocol(express.json()));
 app.use(skipForProtocol(express.urlencoded({ extended: true })));
 app.use(cookieParser());
 
+// ===========================================================================
+// Identity propagation
+// ===========================================================================
+
+// jose is ESM-only; both the OAuth broker and the identity assertion need it, so
+// the dynamic import is memoized here rather than duplicated.
+let josePromise = null;
+function loadJose() {
+    if (!josePromise) josePromise = import('jose');
+    return josePromise;
+}
+
+/**
+ * Make a claim value safe to carry in an HTTP header, the way every other
+ * forward-auth proxy does it: raw UTF-8 bytes, control characters removed.
+ *
+ * We emit the conventional header names (Remote-User & co), so the VALUES have
+ * to follow the same convention too — an app that already understands
+ * `Remote-Name` expects a name, not a percent-encoded one. Anything that could
+ * forge a header boundary (CR, LF, NUL, other C0/C1 controls) is dropped rather
+ * than escaped: no legitimate claim contains one.
+ *
+ * The latin1 round-trip is not a mangling, it is how you put UTF-8 on the wire
+ * from Node: Node serialises header values byte-per-code-unit, so encoding to
+ * UTF-8 first and reinterpreting as latin1 makes the bytes leave the socket as
+ * real UTF-8. A receiver that reads headers as latin1 (Node itself does) must
+ * re-decode; X-AppShield-Assertion carries the exact values for anything that
+ * needs fidelity guarantees rather than convention compatibility.
+ */
+function headerSafe(value) {
+    if (value === undefined || value === null) return '';
+    const clean = String(value).replace(/[\r\n\u0000-\u001f\u007f-\u009f]/g, '');
+    return Buffer.from(clean, 'utf8').toString('latin1');
+}
+
+/**
+ * The identity a session represents, in the shape the backend receives.
+ *
+ * `method` is the part an app must not ignore: `hash` and `oauth` are machine
+ * callers with no human behind them, and an app that treats them as a user
+ * (auditing them, or granting them a user's permissions) is wrong. Human
+ * methods are `oidc` and `password`.
+ */
+function sessionIdentity(session) {
+    if (!session) return null;
+    if (session.oidcSub || session.claims) {
+        const c = session.claims || {};
+        return {
+            method: 'oidc',
+            sub: c.sub || session.oidcSub || '',
+            user: c.user || '',
+            email: c.email || '',
+            name: c.name || '',
+            groups: Array.isArray(c.groups) ? c.groups : [],
+        };
+    }
+    if (session.passwordHash) {
+        // The static-credential mode has exactly one account and no directory
+        // behind it, so USER is the whole identity. No sub: there is no issuer.
+        return { method: 'password', sub: '', user: USERNAME, email: '', name: '', groups: [] };
+    }
+    if (session.authHash) return { method: 'hash', sub: '', user: '', email: '', name: '', groups: [] };
+    return null;
+}
+
+/** Pull the identity claims we forward out of an OIDC id_token claim set. */
+function claimsFromIdToken(claims) {
+    const groups = Array.isArray(claims.groups) ? claims.groups.map(String) : [];
+    return {
+        sub: String(claims.sub || ''),
+        user: String(claims.preferred_username || claims.email || claims.sub || ''),
+        email: String(claims.email || ''),
+        name: String(claims.name || ''),
+        groups,
+    };
+}
+
+/**
+ * Does this identity satisfy OIDC_REQUIRED_GROUPS?
+ *
+ * Fail-closed for interactive OIDC identities only (see REQUIRED_GROUPS above).
+ * An OIDC identity whose IdP asserts no groups at all cannot satisfy a
+ * non-empty requirement — that is the intended outcome, not an oversight: an
+ * app that requires `admins` must not open up because the connector forgot to
+ * send the claim.
+ */
+function groupsAllowed(identity) {
+    if (!REQUIRED_GROUPS.length) return true;
+    if (!identity || identity.method !== 'oidc') return true;
+    return (identity.groups || []).some((g) => REQUIRED_GROUPS.includes(g));
+}
+
+/**
+ * A session minted before this build has `oidcSub` but no `claims`, so its
+ * groups are unknown — indistinguishable from "member of nothing". Denying it
+ * with 403 would strand the user on an error page with no way back; treating it
+ * as unauthenticated sends them through the IdP, which re-mints the session WITH
+ * claims and answers the question for real. Only matters for the one upgrade
+ * where an app turns group enforcement on with sessions already in flight.
+ */
+function isUngradedLegacySession(session, identity) {
+    return Boolean(
+        REQUIRED_GROUPS.length &&
+        identity && identity.method === 'oidc' &&
+        session && session.oidcSub && !session.claims
+    );
+}
+
+function sendForbiddenGroups(res, identity) {
+    const who = identity && identity.user ? identity.user : '(unknown)';
+    console.log(`[Auth Service] Auth check denied: ${who} lacks required group(s) ${REQUIRED_GROUPS.join(',')}`);
+    return res.status(403).send('Forbidden: account is not a member of a permitted group');
+}
+
+/**
+ * A short-lived signed statement of the same identity carried in the headers.
+ *
+ * Purpose is integrity, not confidentiality — it is a JWS, anyone holding it
+ * can read it. The point is that a backend can verify the gate produced it,
+ * which plain headers cannot establish when something other than the gate can
+ * open a connection to the backend.
+ *
+ * Deliberately short-lived (default 60s) and minted per request: it is a
+ * transport of the gate's current answer, never a session token, and must not
+ * be storable and replayable as one.
+ */
+async function mintAssertion(identity) {
+    if (!IDENTITY_ASSERTION_SECRET || !identity) return null;
+    try {
+        const jose = await loadJose();
+        const key = new TextEncoder().encode(IDENTITY_ASSERTION_SECRET);
+        return await new jose.SignJWT({
+            method: identity.method,
+            user: identity.user || undefined,
+            email: identity.email || undefined,
+            name: identity.name || undefined,
+            groups: identity.groups && identity.groups.length ? identity.groups : undefined,
+        })
+            .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
+            .setIssuer('appshield')
+            .setAudience(APP_NAME || 'appshield')
+            .setSubject(identity.sub || identity.user || identity.method)
+            .setIssuedAt()
+            .setExpirationTime(`${IDENTITY_ASSERTION_TTL_SECONDS}s`)
+            .sign(key);
+    } catch (err) {
+        // An assertion we cannot mint must not become an outage: the request is
+        // authenticated either way, and the backend that requires an assertion
+        // will reject it on its own terms.
+        console.error(`[Auth Service] Could not mint identity assertion: ${err.message}`);
+        return null;
+    }
+}
+
+/**
+ * The single 200 path out of /nhl-auth/check.
+ *
+ * Every "authentication succeeded" answer goes through here so that no future
+ * branch can accidentally return a bare OK and leave nginx forwarding whatever
+ * X-Auth-* headers the *client* sent. (nginx blanks them too — this is the
+ * second of the two locks.)
+ */
+async function authOk(req, res, identity) {
+    if (IDENTITY_HEADERS && identity) {
+        // These are the values; nginx fans each one out onto every conventional
+        // header name it answers to (see identity_forward.conf in entrypoint.sh).
+        // Kept under our own prefix on THIS hop so the auth subrequest has one
+        // unambiguous source per value.
+        res.set('X-AppShield-Method', headerSafe(identity.method));
+        res.set('X-AppShield-Sub', headerSafe(identity.sub));
+        res.set('X-AppShield-User', headerSafe(identity.user));
+        res.set('X-AppShield-Email', headerSafe(identity.email));
+        res.set('X-AppShield-Name', headerSafe(identity.name));
+        res.set('X-AppShield-Groups', headerSafe((identity.groups || []).join(',')));
+        const assertion = await mintAssertion(identity);
+        if (assertion) res.set('X-AppShield-Assertion', assertion);
+    }
+    return res.status(200).send('OK');
+}
+
 // Send a 401, attaching the RFC 9728 discovery challenge when the original
 // request targeted the protected path so OAuth clients (claude.ai) can find the
 // auth server.
@@ -549,8 +780,15 @@ app.get('/nhl-auth/check', async (req, res) => {
             const oidcValid = !!session.oidcSub;
 
             if (passwordValid || authHashValid || oidcValid) {
+                const identity = sessionIdentity(session);
+                if (isUngradedLegacySession(session, identity)) {
+                    console.log(`[Auth Service] Re-authenticating pre-groups session (${sessionId.substring(0, 8)}...)`);
+                    delete sessions[sessionId];
+                    return sendUnauthorized(req, res);
+                }
+                if (!groupsAllowed(identity)) return sendForbiddenGroups(res, identity);
                 console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...)`);
-                return res.status(200).send('OK');
+                return await authOk(req, res, identity);
             } else {
                 console.log(`[Auth Service] Auth check failed: Credentials changed, invalidating session (${sessionId.substring(0, 8)}...)`);
                 delete sessions[sessionId];
@@ -586,7 +824,7 @@ app.get('/nhl-auth/check', async (req, res) => {
                 });
             }
 
-            return res.status(200).send('OK');
+            return await authOk(req, res, { method: 'hash', sub: '', user: '', email: '', name: '', groups: [] });
         }
     }
 
@@ -613,7 +851,7 @@ app.get('/nhl-auth/check', async (req, res) => {
         }
         if (headerHashOk) {
             console.log('[Auth Service] Auth check passed via Authorization header (hash)');
-            return res.status(200).send('OK');
+            return await authOk(req, res, { method: 'hash', sub: '', user: '', email: '', name: '', groups: [] });
         }
     }
 
@@ -625,12 +863,18 @@ app.get('/nhl-auth/check', async (req, res) => {
         const m = /^Bearer\s+(.+)$/i.exec(authHeader);
         if (m && m[1].split('.').length === 3) {
             try {
-                await oauthJose.jwtVerify(m[1], oauthLocalJWKS, {
+                const verified = await oauthJose.jwtVerify(m[1], oauthLocalJWKS, {
                     issuer: OAUTH_ISSUER,
                     audience: OAUTH_RESOURCE,
                 });
                 console.log('[Auth Service] Auth check passed via Bearer JWT');
-                return res.status(200).send('OK');
+                // A machine caller: `sub` is the OAuth client/grant subject, not
+                // a person. Reported as method=oauth so the backend can tell.
+                return await authOk(req, res, {
+                    method: 'oauth',
+                    sub: String(verified.payload.sub || ''),
+                    user: '', email: '', name: '', groups: [],
+                });
             } catch (e) {
                 console.log(`[Auth Service] Bearer JWT rejected: ${e.message}`);
                 // fall through to the remaining checks / 401
@@ -667,8 +911,15 @@ app.get('/nhl-auth/check', async (req, res) => {
     }
 
     // Session is valid
+    const identity = sessionIdentity(session);
+    if (isUngradedLegacySession(session, identity)) {
+        console.log(`[Auth Service] Re-authenticating pre-groups session (${sessionId.substring(0, 8)}...)`);
+        delete sessions[sessionId];
+        return sendUnauthorized(req, res);
+    }
+    if (!groupsAllowed(identity)) return sendForbiddenGroups(res, identity);
     console.log(`[Auth Service] Auth check passed via session (${sessionId.substring(0, 8)}...)`);
-    res.status(200).send('OK');
+    return await authOk(req, res, identity);
 });
 
 // Establish session endpoint (for hash authentication to set cookies properly)
@@ -806,13 +1057,26 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
             { state: params.state, code_verifier: flow.codeVerifier },
         );
         const claims = tokenSet.claims();
+        const identityClaims = claimsFromIdToken(claims);
+
+        // Enforce group membership BEFORE minting a session. Checking only at
+        // /nhl-auth/check would also work, but the user would arrive back with a
+        // cookie they cannot use and a bare 403 on every page; refusing here
+        // says why, once, and leaves no session behind.
+        if (!groupsAllowed({ method: 'oidc', ...identityClaims })) {
+            console.log(`[Auth Service] OIDC login denied for sub=${claims.sub}: not in ${REQUIRED_GROUPS.join(',')}`);
+            return res.status(403).send(
+                'Forbidden: your account is not a member of a group permitted to use this application.'
+            );
+        }
 
         const sessionId = generateSessionId();
         sessions[sessionId] = {
             expires: Date.now() + SESSION_DURATION_MS,
             oidcSub: claims.sub,
+            claims: identityClaims,
         };
-        console.log(`[Auth Service] OIDC session created for sub=${claims.sub} (${sessionId.substring(0, 8)}...)`);
+        console.log(`[Auth Service] OIDC session created for sub=${claims.sub} user=${identityClaims.user || '(none)'} groups=[${identityClaims.groups.join(',')}] (${sessionId.substring(0, 8)}...)`);
 
         res.cookie('appshield_session', sessionId, {
             httpOnly: true,
@@ -825,6 +1089,33 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
         console.error('[Auth Service] OIDC callback failed:', err);
         res.status(500).send('OIDC callback failed: ' + err.message);
     }
+});
+
+// Sign out: destroy the gate session and clear the cookie.
+//
+// Deliberately renders a terminal page instead of redirecting to `/`. The IdP
+// session outlives ours (Dex holds a 30-day SSO session), so bouncing the
+// browser back through the gate would silently re-authenticate and look like
+// logout did nothing. Landing here makes the state unambiguous; the link then
+// starts a fresh, deliberate login.
+app.all('/nhl-auth/logout', (req, res) => {
+    const sessionId = req.cookies.appshield_session;
+    if (sessionId && sessions[sessionId]) {
+        delete sessions[sessionId];
+        console.log(`[Auth Service] Session destroyed on logout (${sessionId.substring(0, 8)}...)`);
+    }
+    res.clearCookie('appshield_session');
+    res.status(200).type('html').send(
+        '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Signed out</title>' +
+        '<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;' +
+        'justify-content:center;height:100vh;margin:0;background:#f5f7fa;color:#294056}' +
+        'div{text-align:center}a{color:#27b4e1}</style></head><body><div>' +
+        '<h1>Signed out</h1><p>Your session on this application has ended.</p>' +
+        '<p><a href="/">Sign in again</a></p>' +
+        '<p style="font-size:.85em;opacity:.7">You may still be signed in with your ' +
+        'identity provider; signing in again may not ask for your password.</p>' +
+        '</div></body></html>'
+    );
 });
 
 // Health check
@@ -1260,6 +1551,15 @@ app.listen(PORT, () => {
     console.log(`[Auth Service] OIDC enabled: ${OIDC_ENABLED ? `Yes (registrar=${OIDC_REGISTRAR_URL})` : 'No'}`);
     console.log(`[Auth Service] Session duration: ${SESSION_DURATION_HOURS} hours`);
     console.log(`[Auth Service] OAuth enabled: ${OAUTH_ENABLED ? `Yes (resource=${OAUTH_RESOURCE})` : 'No'}`);
+    console.log(`[Auth Service] Identity headers: ${IDENTITY_HEADERS ? 'on' : 'off'}` +
+        (IDENTITY_HEADERS ? ` (assertion: ${IDENTITY_ASSERTION_SECRET ? `signed, ${IDENTITY_ASSERTION_TTL_SECONDS}s` : 'unsigned headers only'})` : ''));
+    console.log(`[Auth Service] Required groups: ${REQUIRED_GROUPS.length ? REQUIRED_GROUPS.join(',') : '(none — any authenticated identity)'}`);
+    if (IDENTITY_ASSERTION_SECRET && !IDENTITY_HEADERS) {
+        console.warn('[Auth Service] WARNING: IDENTITY_ASSERTION_SECRET is set but IDENTITY_HEADERS is off — no identity is forwarded.');
+    }
+    if (REQUIRED_GROUPS.length && !OIDC_ENABLED) {
+        console.warn('[Auth Service] WARNING: OIDC_REQUIRED_GROUPS is set but OIDC is off — no identity carries groups, so it has no effect.');
+    }
     console.log('=====================================');
 
     if (OAUTH_ENABLED) {

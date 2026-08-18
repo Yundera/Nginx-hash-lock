@@ -72,6 +72,19 @@ environment:
 > than silently serving unprotected. Use `OAUTH_RESOURCE`, or `AUTH_HASH` with
 > `AUTH_HASH_MODE=env|managed`, for non-interactive access.
 
+  # Identity propagation — tell the backend WHO got in (see "Identity propagation")
+  IDENTITY_HEADERS: "off"                # Optional: DEFAULT IS ON. Set to off to stop forwarding the
+                                         # user's identity (Remote-User & co) to the backend.
+  IDENTITY_ASSERTION_SECRET: "<secret>"  # Optional: also emit X-AppShield-Assertion, a signed JWT of
+                                         # same claims. Required for any backend that other containers
+                                         # on the network can reach directly.
+  IDENTITY_ASSERTION_TTL_SECONDS: "60"   # Optional: assertion lifetime (default shown, minimum 5)
+
+  # Authorization — restrict WHICH authenticated identities may enter
+  OIDC_REQUIRED_GROUPS: "admins"         # Optional: comma-separated. An interactive OIDC identity must
+                                         # be in at least one. Empty (default) = any identity the IdP
+                                         # authenticates gets in. Does not apply to machine auth.
+
 **Bypass Options:**
 ```yaml
   ALLOWED_EXTENSIONS: "js,css,png,ico"   # Optional: Allow static files without auth
@@ -133,6 +146,102 @@ The mode is selected automatically from which variables are set:
 > API / non-human clients pass `?hash=YOUR_SECRET_HASH` and bypass the redirect. The auth
 > service honours a valid hash in any mode. (Static `USER`/`PASSWORD` credential mode does
 > **not** compose with OIDC — use hash for machine access alongside OIDC.)
+
+## Identity propagation
+
+AppShield forwards the authenticated identity to the backend, using the header names the
+forward-auth ecosystem already settled on. An off-the-shelf app that supports
+"authentication by trusted proxy" therefore works behind the gate with no patch, and our own
+apps get one contract to read.
+
+**On by default.** Set `IDENTITY_HEADERS: "off"` for an app that must not receive the user's
+email/name/groups, or one that mishandles these headers.
+
+| Header(s) | Value | Present for |
+|---|---|---|
+| `Remote-User`, `X-Forwarded-User`, `X-Auth-Request-User`, `X-Forwarded-Preferred-Username`, `X-Auth-Request-Preferred-Username` | `preferred_username` (falls back to email, then sub); `USER` in credentials mode | `oidc`, `password` |
+| `Remote-Email`, `X-Forwarded-Email`, `X-Auth-Request-Email` | email claim | `oidc` |
+| `Remote-Name` | display name | `oidc` |
+| `Remote-Groups`, `X-Forwarded-Groups`, `X-Auth-Request-Groups` | comma-separated groups claim | `oidc` |
+| `X-AppShield-Method` | `oidc` \| `password` \| `hash` \| `oauth` | every authenticated request |
+| `X-AppShield-Sub` | IdP subject identifier | `oidc`, `oauth` |
+| `X-AppShield-Assertion` | signed JWT of all of the above | when `IDENTITY_ASSERTION_SECRET` is set |
+
+The `Remote-*` set is Authelia's and Traefik's; the `X-Forwarded-*` / `X-Auth-Request-*`
+aliases are oauth2-proxy's. They all carry the same values, so an app can read whichever
+family it already supports. Only the three facts that have **no** convention — which
+mechanism authenticated the caller, the IdP subject, and our signed assertion — use an
+`X-AppShield-*` name.
+
+**`X-AppShield-Method` is not decoration.** `hash` and `oauth` are non-interactive callers
+with no person behind them; they get no `Remote-User`. An app that treats them as a user —
+attributing actions to them, or granting them a user's permissions — is wrong.
+
+**Values are raw UTF-8**, as the convention expects, with control characters stripped. Note
+that HTTP header values are bytes: a receiver that decodes them as latin-1 (Node does, by
+default) must re-decode as UTF-8 to render a name like `Alice Ré` correctly. Anything
+needing exact fidelity should read the assertion instead.
+
+**Empty means absent.** nginx drops a header whose value is empty, so a claim the IdP did
+not assert simply does not arrive — never as an empty string.
+
+### Trust model — read this before relying on the headers
+
+Using the conventional names means real apps will act on them, which cuts both ways:
+
+- **The gate always wins over the client.** On every proxied path — authenticated, bypassed
+  via `ALLOWED_PATHS`/`ALLOWED_EXTENSIONS`, hash-content, OAuth resource — nginx overwrites
+  the entire set: with the gate's values where there is an identity, with nothing where
+  there isn't. A client that sends `Remote-User: admin` never has it reach the backend. This
+  holds with `IDENTITY_HEADERS` on **or** off, and is the reason the off switch is not a
+  security control.
+- **The gate does not win over the network.** If the backend is reachable by anything other
+  than its gate — and on a shared docker network like `pcs`, every other app container is
+  "anything other than the gate" — that peer can connect directly and send whatever headers
+  it likes.
+
+So: for an app whose backend is only routable through its gate (no caddy labels, no published
+ports — the standard Yundera app shape), the plain headers are enough. For a privileged app,
+set `IDENTITY_ASSERTION_SECRET` and have the backend **verify** `X-AppShield-Assertion`
+instead of trusting the plain headers:
+
+```
+alg  HS256, signed with IDENTITY_ASSERTION_SECRET
+iss  appshield
+aud  APP_NAME
+sub  the IdP subject (or username where there is no IdP)
+exp  now + IDENTITY_ASSERTION_TTL_SECONDS (default 60s)
+     plus method / user / email / name / groups
+```
+
+It is minted per request and deliberately short-lived: it transports the gate's answer for
+*this* request. It is not a session token and must not be stored or replayed as one.
+
+### Restricting who may enter
+
+`OIDC_REQUIRED_GROUPS` turns the gate from authenticate-only into authorize-too: an
+interactive OIDC identity must be in at least one of the listed groups. It is enforced
+twice — at the callback, so a rejected user gets one clear 403 instead of a cookie they
+cannot use, and on every subsequent check, so tightening the list also evicts sessions
+that already exist.
+
+An OIDC identity with no `groups` claim at all cannot satisfy a non-empty requirement.
+That is intentional: an app that requires `admins` must not open up because a connector
+forgot to send the claim.
+
+Machine auth (`hash`, `oauth`) is exempt — it carries no groups, and gating it here would
+silently cut off API access the moment an app adopted group enforcement. Use a separate
+gate, or omit `AUTH_HASH`, if machines must be excluded too.
+
+### Signing out
+
+`GET|POST /nhl-auth/logout` destroys the gate session, clears the cookie, and renders a
+terminal "Signed out" page.
+
+It deliberately does **not** bounce back to `/`. The identity provider's own session
+outlives the gate's (Dex holds a 30-day SSO session), so redirecting through the gate
+would silently re-authenticate and make logout look broken. Ending on a static page makes
+the state unambiguous; the link on it starts a fresh, deliberate login.
 
 ### Important for CasaOS Deployments
 
