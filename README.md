@@ -293,13 +293,71 @@ authorization. Treat `IDENTITY_ASSERTION_SECRET` accordingly.
 
 ### Signing out
 
-`GET|POST /nhl-auth/logout` destroys the gate session, clears the cookie, and renders a
-terminal "Signed out" page.
+`GET|POST /nhl-auth/logout` ends the gate session and clears the cookie. What happens next
+depends on what the identity provider supports, and the difference is the whole story.
 
-It deliberately does **not** bounce back to `/`. The identity provider's own session
-outlives the gate's (Dex holds a 30-day SSO session), so redirecting through the gate
-would silently re-authenticate and make logout look broken. Ending on a static page makes
-the state unambiguous; the link on it starts a fresh, deliberate login.
+**When the OP advertises an `end_session_endpoint`** (OIDC RP-Initiated Logout 1.0), the
+gate redirects the browser there with an `id_token_hint`, a `client_id`, and a
+`post_logout_redirect_uri` pointing at `/nhl-auth/logged-out`. That ends the OP session
+too — so the next sign-in genuinely asks for a credential instead of silently replaying
+one. If the OP also supports **Back-Channel Logout 1.0**, it then notifies every *other*
+app in the session, so one sign-out ends them all.
+
+**When it does not**, the gate falls back to a terminal "Signed out" page and says plainly
+that the IdP session outlives this one. It deliberately does not bounce to `/`: the OP
+would silently re-authenticate and logout would look broken.
+
+Either way this is **best effort**. No OIDC session, no discovered client, an OP without a
+logout endpoint, or a failure reaching it all fall through to the terminal page — failing
+to reach the OP must never trap a user inside an app whose session was already destroyed.
+
+Upstream is **not** propagated: signing out here does not sign you out of the IdP *behind*
+the OP (e.g. a cloud account federated through Dex), the same way signing out of Keycloak
+does not sign you out of Google. That is the norm the specs state. A deployment that wants
+it offers a separate, deliberate affordance — the Yundera admin app's `UPSTREAM_LOGOUT_URL`.
+
+> **Version note.** Dex advertised no logout of any kind through v2.45.1 — no
+> `end_session_endpoint`, no browser session, a connector re-run on every `/authorize`. RP-
+> Initiated and Back-Channel Logout are merged upstream but unreleased, and only take effect
+> with `DEX_SESSIONS_ENABLED=true`. Against a Dex without them this gate takes the fallback
+> path above, which is exactly the old behaviour.
+
+`GET` is supported so the route can be linked (`403.html` does, as the way out of a
+wrong-account dead end). To keep that from becoming a cross-site force-logout, a request
+carrying `Sec-Fetch-Site: cross-site` with a `Sec-Fetch-Dest` other than `document` is
+refused with 403 — that is an `<img>`/`<script>` load, never a real sign-out. Same-site
+requests are unaffected.
+
+### Back-channel logout
+
+`POST /nhl-auth/backchannel-logout` receives a signed logout token when *another* app ends
+a session this gate took part in (OIDC Back-Channel Logout 1.0). This is what makes logout
+reach every app: each gate holds its own host-only `appshield_session`, so without it,
+signing out of one app leaves the rest open for the remainder of their 30 days.
+
+The endpoint is deliberately **unauthenticated by network and by cookie** — everything
+under `/nhl-auth/` is internet-reachable and nginx proxies it from `127.0.0.1`, so neither
+tells us anything. The JWS signature over the OP's JWKS is the entire check, which is why
+every validation is mandatory and a failure is a 400 rather than a quiet 200:
+
+- signature verifies against the issuer's JWKS, with `iss` and `aud` (this `client_id`)
+- the `http://schemas.openid.net/event/backchannel-logout` event is present
+- `nonce` is **absent** — this is what stops an ID token, signed by the same key, from
+  being replayed here as a logout token
+- at least one of `sid` / `sub` is present
+
+`sid` is preferred: it names one session at the OP, so a user signed in on a phone and a
+laptop only loses the one they signed out of. `sub` is the fallback for an OP that issues
+no `sid`, and ends all of that subject's sessions here.
+
+A successful call returns `200` with an empty body and `Cache-Control: no-store`. Zero
+matching sessions is still success — "no session here" is the state the OP asked for, and
+reporting the count would leak whether a given user is signed in to this app.
+
+Registration of both `post_logout_redirect_uris` and `backchannel_logout_uri` is handled by
+the registrar: the gate sends only `post_logout_path` / `backchannel_logout_path`, and the
+registrar supplies the hosts (the same contract as `callback_path`). A registrar that does
+not understand them ignores them, and logout degrades to this gate only.
 
 ### Important for CasaOS Deployments
 

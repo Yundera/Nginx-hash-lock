@@ -113,6 +113,14 @@ const REDIRECT_HOST_SUFFIXES = (process.env.REDIRECT_HOST_SUFFIXES || '')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 const CALLBACK_PATH = '/nhl-auth/oidc/callback';
+// Where the OP sends the browser back after RP-Initiated Logout. A route of our
+// own rather than '/', because landing on '/' would immediately start a fresh
+// login and make logout look like it did nothing.
+const POST_LOGOUT_PATH = '/nhl-auth/logged-out';
+// Where the OP POSTs a signed logout token when ANOTHER app ends the shared
+// session (OIDC Back-Channel Logout 1.0). Unauthenticated by design — the
+// signature is the authentication.
+const BACKCHANNEL_LOGOUT_PATH = '/nhl-auth/backchannel-logout';
 
 function computeAppHosts(appName) {
     return REDIRECT_HOST_SUFFIXES.map((suffix) => `${appName}-${suffix}`.toLowerCase());
@@ -207,6 +215,10 @@ const sessions = new Proxy(loadSessions(), {
 // need the public Host header to compute the redirect URI before calling the registrar.
 let oidcClient = null;
 let oidcIssuerUrl = null;
+// Cached remote JWKS for verifying back-channel logout tokens. Built lazily on
+// the first logout token so a gate that never receives one never fetches it, and
+// reused after that — jose's remote key set does its own caching and rotation.
+let backchannelJWKS = null;
 
 // OAuth provider state — populated asynchronously by bootstrapOauthProvider()
 // after app.listen (oidc-provider v9 is ESM-only, loaded via dynamic import).
@@ -297,6 +309,16 @@ function chosenRedirect(req) {
     return `${base}${CALLBACK_PATH}`;
 }
 
+// Same origin selection as chosenRedirect, for the post_logout_redirect_uri.
+// It must match one the OP has registered or the OP drops it and dead-ends on
+// its own page, so it is derived the same way the callback is rather than from
+// the raw request Host.
+function chosenPostLogout(req) {
+    const origin = getPublicOrigin(req);
+    const base = allowedOrigins.has(origin) ? origin : (fallbackOrigin || origin);
+    return `${base}${POST_LOGOUT_PATH}`;
+}
+
 // Replace our guessed host set with the registrar's authoritative one. This is
 // what lets a login that started on the bare root domain finish there instead of
 // being bounced to <app>-<suffix>: that host is in the registrar's list and can
@@ -354,7 +376,16 @@ async function initOidcClient(publicOrigin) {
     const response = await fetch(`${OIDC_REGISTRAR_URL}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ callback_path: CALLBACK_PATH, redirect_uris: guessedCallbacks }),
+        // post_logout_path / backchannel_logout_path let the registrar derive the
+        // logout URIs on the same host set it already derives the callbacks from.
+        // A registrar that does not understand them ignores them and logout
+        // degrades to ending only this gate's session — no failure, less reach.
+        body: JSON.stringify({
+            callback_path: CALLBACK_PATH,
+            redirect_uris: guessedCallbacks,
+            post_logout_path: POST_LOGOUT_PATH,
+            backchannel_logout_path: BACKCHANNEL_LOGOUT_PATH,
+        }),
     });
     if (!response.ok) {
         const body = await response.text();
@@ -1084,6 +1115,15 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
             expires: Date.now() + SESSION_DURATION_MS,
             oidcSub: claims.sub,
             claims: identityClaims,
+            // Kept for RP-Initiated Logout: sending it as id_token_hint is what
+            // lets the OP end the *right* session without asking the user to
+            // confirm, and is what the spec asks an RP to supply.
+            idToken: tokenSet.id_token,
+            // Session id at the OP (OIDC Back-Channel Logout 1.0). Present only
+            // once the OP issues one — Dex does from the release that added
+            // back-channel logout. Without it we can still act on a logout token
+            // that carries `sub`, just less precisely.
+            oidcSid: claims.sid,
         };
         console.log(`[Auth Service] OIDC session created for sub=${claims.sub} user=${identityClaims.user || '(none)'} groups=[${identityClaims.groups.join(',')}] (${sessionId.substring(0, 8)}...)`);
 
@@ -1095,20 +1135,16 @@ app.get('/nhl-auth/oidc/callback', async (req, res) => {
     }
 });
 
-// Sign out: destroy the gate session and clear the cookie.
-//
-// Deliberately renders a terminal page instead of redirecting to `/`. The IdP
-// session outlives ours (Dex holds a 30-day SSO session), so bouncing the
-// browser back through the gate would silently re-authenticate and look like
-// logout did nothing. Landing here makes the state unambiguous; the link then
-// starts a fresh, deliberate login.
-app.all('/nhl-auth/logout', (req, res) => {
-    const sessionId = req.cookies.appshield_session;
-    if (sessionId && sessions[sessionId]) {
-        delete sessions[sessionId];
-        console.log(`[Auth Service] Session destroyed on logout (${sessionId.substring(0, 8)}...)`);
-    }
-    res.clearCookie('appshield_session', {httpOnly: true, secure: req.protocol === 'https', sameSite: 'lax'});
+// The one thing a terminal sign-out page must not do is overstate itself. Shown
+// whenever this gate could not reach an OP that would end the upstream session.
+const IDP_STILL_SIGNED_IN_NOTE =
+    'You may still be signed in with your identity provider; ' +
+    'signing in again may not ask for your password.';
+
+// Renders the terminal "you are signed out" page. Terminal rather than a bounce
+// to `/`, because a redirect back through the gate would start a fresh login and
+// make logout look like it did nothing.
+function signedOutPage(res, note) {
     res.status(200).type('html').send(
         '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Signed out</title>' +
         '<style>body{font-family:system-ui,sans-serif;display:flex;align-items:center;' +
@@ -1116,10 +1152,208 @@ app.all('/nhl-auth/logout', (req, res) => {
         'div{text-align:center}a{color:#27b4e1}</style></head><body><div>' +
         '<h1>Signed out</h1><p>Your session on this application has ended.</p>' +
         '<p><a href="/">Sign in again</a></p>' +
-        '<p style="font-size:.85em;opacity:.7">You may still be signed in with your ' +
-        'identity provider; signing in again may not ask for your password.</p>' +
+        (note ? `<p style="font-size:.85em;opacity:.7">${note}</p>` : '') +
         '</div></body></html>'
     );
+}
+
+// Where the OP returns the browser after RP-Initiated Logout. By this point both
+// the gate session (ended below, before the redirect) and the OP session are
+// gone, so there is nothing left to warn about.
+app.all(POST_LOGOUT_PATH, (req, res) => {
+    res.clearCookie('appshield_session', {httpOnly: true, secure: req.protocol === 'https', sameSite: 'lax'});
+    signedOutPage(res);
+});
+
+// Sign out.
+//
+// TWO SESSIONS END HERE, and only one of them is ours.
+//
+// Historically this route could only destroy the gate's own session and then say
+// so, because Dex held no browser session and advertised no end_session_endpoint:
+// the long-lived session belonged to whatever sat BEHIND Dex (Authelia, or the
+// upstream cloud IdP), on a host whose cookie we cannot reach. Signing in again
+// therefore did not ask for a password, and the page had to admit it.
+//
+// That changed when Dex gained sessions and RP-Initiated Logout. When the OP
+// advertises an end_session_endpoint we now hand the browser to it with an
+// id_token_hint, which ends the OP session too — and, because the OP also
+// supports Back-Channel Logout, ends every OTHER app's gate session by having
+// the OP notify each one. One click, every app, through the spec.
+//
+// STILL BEST-EFFORT, deliberately. Every branch below falls through to the
+// terminal page: no OIDC session, no discovered client, an OP without an
+// end_session_endpoint, a lookup that throws. Failing to reach the OP must never
+// trap the user inside this app with a session we already destroyed.
+//
+// UPSTREAM IS NOT PROPAGATED, also deliberately: logging out here does not log
+// you out of Yundera or Authelia, the same way logging out of Keycloak does not
+// log you out of Google. That is the norm the specs state; the deliberate
+// "also sign out of Yundera" affordance lives in the dashboard.
+//
+// GET is deliberate and must stay — 403.html links here, and a sign-out a user
+// can reach by navigation is the point. That does make it forgeable across
+// sites (an <img> tag is enough), which for logout costs a session rather than
+// granting one, but it is still a nuisance a third party should not be able to
+// inflict. Sec-Fetch-Dest tells the two apart: a real sign-out is a document
+// navigation or a fetch the page made, never a subresource load. Browsers that
+// send no Sec-Fetch-* headers fall through and are handled as before.
+app.all('/nhl-auth/logout', async (req, res) => {
+    const fetchDest = req.headers['sec-fetch-dest'];
+    const fetchSite = req.headers['sec-fetch-site'];
+    if (fetchSite === 'cross-site' && fetchDest && fetchDest !== 'document') {
+        console.log(`[Auth Service] Ignoring cross-site logout attempt (dest=${fetchDest})`);
+        return res.status(403).type('text/plain').send(
+            'Cross-site sign-out requests are ignored. Open the sign-out link directly.'
+        );
+    }
+
+    // Read the id_token BEFORE destroying the session — it is the hint that
+    // makes the OP-side logout precise, and it dies with the session record.
+    const sessionId = req.cookies.appshield_session;
+    const session = sessionId ? sessions[sessionId] : null;
+    const idToken = session && session.idToken;
+    // Whether there was an upstream at all. Read alongside the id_token because
+    // the two disagree for sessions minted before this gate stored id_tokens,
+    // and that disagreement decides what we are honest about below.
+    const wasOidc = !!(session && session.oidcSub);
+
+    if (sessionId && sessions[sessionId]) {
+        delete sessions[sessionId];
+        console.log(`[Auth Service] Session destroyed on logout (${sessionId.substring(0, 8)}...)`);
+    }
+    res.clearCookie('appshield_session', {httpOnly: true, secure: req.protocol === 'https', sameSite: 'lax'});
+
+    // Only an OIDC session has an OP to log out of.
+    //
+    // Two different situations land here, and they deserve different pages. A
+    // password/hash session has no upstream at all, so the terminal page IS the
+    // whole story. An OIDC session minted before this gate started storing
+    // id_tokens does have an upstream — we simply can no longer name it, which
+    // is precisely the case the note exists for. Observed on wisera during the
+    // 2026-08-19 upgrade: every pre-upgrade session took this branch, and
+    // saying nothing claimed a completeness we had not delivered.
+    if (!idToken) {
+        return signedOutPage(res, wasOidc ? IDP_STILL_SIGNED_IN_NOTE : undefined);
+    }
+
+    try {
+        // Already-initialised client only: getOidcClient() would re-register
+        // against the registrar, and a logout must not depend on that round trip
+        // being available.
+        const endSession = oidcClient
+            && oidcClient.issuer
+            && oidcClient.issuer.metadata
+            && oidcClient.issuer.metadata.end_session_endpoint;
+        if (!endSession) {
+            // Pre-sessions Dex lands here. Say plainly that the IdP session
+            // outlives ours rather than implying the user is fully signed out.
+            return signedOutPage(res, IDP_STILL_SIGNED_IN_NOTE);
+        }
+
+        const url = new URL(endSession);
+        url.searchParams.set('id_token_hint', idToken);
+        url.searchParams.set('client_id', oidcClient.client_id);
+        url.searchParams.set('post_logout_redirect_uri', chosenPostLogout(req));
+        console.log(`[Auth Service] Redirecting to OP end_session_endpoint for RP-initiated logout`);
+        return res.redirect(302, url.toString());
+    } catch (err) {
+        console.error('[Auth Service] RP-initiated logout failed, ending locally only:', err.message);
+        return signedOutPage(res,
+            'Your session here has ended, but your identity provider could not be reached.');
+    }
+});
+
+// ===========================================================================
+// OIDC Back-Channel Logout 1.0 receiver
+//
+// WHY THIS IS THE ONE THAT MAKES LOGOUT MEAN SOMETHING. Every app on a PCS has
+// its OWN gate with its OWN `appshield_session` cookie, host-only to
+// <app>-<domain>. Ending one of them ends exactly one app; the others stay open
+// for the rest of their 30 days. Sweeping them from a peer app was the old plan
+// and it was wrong in two ways: it needed a shared secret across gates that do
+// not share one, and it was Front-Channel Logout reimplemented by an RP, which
+// is not a topology any spec describes.
+//
+// Back-channel logout inverts it correctly. The OP knows every client in the
+// session; when one client logs out, the OP POSTs a signed logout token to each
+// of the others. Server to server, no browser, no shared secret between gates —
+// the OP's signature is the authorization, and every gate already trusts it
+// because that is how it authenticates users in the first place.
+//
+// NOT AUTHENTICATED BY NETWORK OR COOKIE, on purpose. Everything under
+// /nhl-auth/ is reachable from the internet, and nginx proxies it from
+// 127.0.0.1, so neither origin nor session tells us anything. The JWS signature
+// over the OP's JWKS is the whole check — which is why every validation below
+// is mandatory rather than best-effort, and why a failure is a 400 and not a
+// silent 200.
+// ===========================================================================
+app.post(BACKCHANNEL_LOGOUT_PATH, express.urlencoded({ extended: false }), async (req, res) => {
+    const logoutToken = req.body && req.body.logout_token;
+    if (!logoutToken) {
+        return res.status(400).json({ error: 'invalid_request', error_description: 'missing logout_token' });
+    }
+    if (!oidcClient || !oidcClient.issuer || !oidcClient.issuer.metadata) {
+        // Nothing to verify against yet. 503 rather than 400: the request may be
+        // perfectly valid and the OP is entitled to retry.
+        return res.status(503).json({ error: 'temporarily_unavailable' });
+    }
+
+    try {
+        const jose = await loadJose();
+        const meta = oidcClient.issuer.metadata;
+        if (!backchannelJWKS) {
+            backchannelJWKS = jose.createRemoteJWKSet(new URL(meta.jwks_uri));
+        }
+        const { payload } = await jose.jwtVerify(logoutToken, backchannelJWKS, {
+            issuer: meta.issuer,
+            audience: oidcClient.client_id,
+        });
+
+        // Spec §2.4: the token MUST carry the backchannel-logout event, and MUST
+        // NOT carry a nonce. The nonce check is what stops an ID token — which
+        // is signed by the same key and would otherwise verify — from being
+        // replayed here as a logout token.
+        const events = payload.events || {};
+        if (!Object.prototype.hasOwnProperty.call(events, 'http://schemas.openid.net/event/backchannel-logout')) {
+            return res.status(400).json({ error: 'invalid_request', error_description: 'missing backchannel-logout event' });
+        }
+        if (payload.nonce !== undefined) {
+            return res.status(400).json({ error: 'invalid_request', error_description: 'nonce is prohibited in a logout token' });
+        }
+        if (!payload.sid && !payload.sub) {
+            return res.status(400).json({ error: 'invalid_request', error_description: 'logout token must carry sid or sub' });
+        }
+
+        // Prefer `sid`: it names ONE session at the OP, so a user signed in on a
+        // phone and a laptop only loses the one they signed out of. `sub` is the
+        // fallback for an OP that issues no sid, and deliberately ends all of
+        // that subject's sessions here — the spec's own semantics.
+        let ended = 0;
+        for (const [id, sess] of Object.entries(sessions)) {
+            const match = payload.sid
+                ? sess.oidcSid === payload.sid
+                : sess.oidcSub === payload.sub;
+            if (match) {
+                delete sessions[id];
+                ended++;
+            }
+        }
+        if (ended > 0) {
+            saveSessionsSoon();
+        }
+        console.log(`[Auth Service] Back-channel logout: ended ${ended} session(s) (${payload.sid ? 'sid' : 'sub'})`);
+
+        // 200 with no-store, per spec. Reporting how many sessions matched would
+        // leak whether this user is signed in here to anyone who can reach the
+        // endpoint, so the body stays empty and zero matches is still a success:
+        // "no session here" is the state the OP asked us to be in.
+        res.set('Cache-Control', 'no-store');
+        return res.status(200).end();
+    } catch (err) {
+        console.error('[Auth Service] Back-channel logout rejected:', err.message);
+        return res.status(400).json({ error: 'invalid_request', error_description: 'logout token validation failed' });
+    }
 });
 
 // ===========================================================================
