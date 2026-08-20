@@ -1,5 +1,5 @@
 # .github/workflows/docker-publish.yml
-name: App Dashboard Docker Publish
+name: AppShield Docker Publish
 on:
   push:
     branches: [ main ]
@@ -20,6 +20,18 @@ jobs:
         with:
           fetch-depth: 0
           submodules: 'true'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Vet and test
+        run: |
+          test -z "$(gofmt -l .)" || (echo "gofmt: files need formatting:"; gofmt -l .; exit 1)
+          go vet ./...
+          go test -race ./...
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to GitHub Container Registry
@@ -49,5 +61,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
