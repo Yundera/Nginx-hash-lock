@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access denied · AppShield</title>
+    <style>
+        :root {
+            --bg-1: #0f172a;
+            --bg-2: #1e293b;
+            --accent: #4f46e5;
+            --accent-2: #2563eb;
+            --ink: #0f172a;
+            --muted: #64748b;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: radial-gradient(1200px 600px at 50% -10%, #243049 0%, var(--bg-1) 60%), var(--bg-2);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--ink);
+            padding: 1.5rem;
+        }
+
+        .container {
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 20px 50px rgba(2, 6, 23, 0.45);
+            padding: 2.75rem;
+            text-align: center;
+            max-width: 480px;
+            width: 100%;
+        }
+
+        .shield {
+            width: 72px;
+            height: 72px;
+            margin: 0 auto 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .shield svg { width: 100%; height: 100%; }
+
+        h1 {
+            color: var(--ink);
+            margin-bottom: 0.5rem;
+            font-size: 1.6rem;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+        }
+
+        .error-code {
+            color: #b91c1c;
+            font-size: 0.95rem;
+            font-weight: 600;
+            margin-bottom: 1.25rem;
+            letter-spacing: 0.02em;
+        }
+
+        p { color: var(--muted); line-height: 1.6; margin-bottom: 1rem; font-size: 0.95rem; }
+
+        .auth-info {
+            background: #f8fafc;
+            border-left: 3px solid var(--accent-2);
+            padding: 1rem;
+            margin: 1.5rem 0;
+            border-radius: 0 8px 8px 0;
+            text-align: left;
+        }
+
+        .auth-info strong {
+            color: #334155;
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .code-example {
+            background: #0f172a;
+            color: #e2e8f0;
+            padding: 0.75rem;
+            border-radius: 8px;
+            font-family: ui-monospace, 'SF Mono', 'Courier New', monospace;
+            font-size: 0.85rem;
+            margin: 0.5rem 0 0;
+            word-break: break-all;
+        }
+
+        .help-section {
+            margin-top: 2rem;
+            padding-top: 1.75rem;
+            border-top: 1px solid #eef2f7;
+        }
+
+        .help-section h3 {
+            color: #334155;
+            margin-bottom: 0.85rem;
+            font-size: 1rem;
+        }
+
+        .help-section ul {
+            text-align: left;
+            color: var(--muted);
+            line-height: 1.6;
+            font-size: 0.9rem;
+            padding-left: 1.2rem;
+        }
+
+        .help-section li { margin-bottom: 0.4rem; }
+
+        .footer {
+            margin-top: 2rem;
+            padding-top: 1.25rem;
+            border-top: 1px solid #eef2f7;
+            color: #94a3b8;
+            font-size: 0.78rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.4rem;
+        }
+        .footer .mark {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-weight: 600;
+            color: #64748b;
+        }
+        .footer .mark svg { width: 14px; height: 14px; }
+
+        @media (max-width: 480px) {
+            .container { padding: 2rem 1.5rem; }
+            h1 { font-size: 1.4rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="shield">
+            <!-- AppShield mark (denied state) -->
+            <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <defs>
+                    <linearGradient id="as-grad" x1="12" y1="6" x2="52" y2="58" gradientUnits="userSpaceOnUse">
+                        <stop offset="0" stop-color="#6366f1"/>
+                        <stop offset="1" stop-color="#2563eb"/>
+                    </linearGradient>
+                </defs>
+                <path d="M32 4 L54 13 V30 C54 45 44.5 54.5 32 60 C19.5 54.5 10 45 10 30 V13 Z"
+                      fill="url(#as-grad)"/>
+                <path d="M32 11 L47.5 17.4 V30 C47.5 41 40.8 48.4 32 52.6 C23.2 48.4 16.5 41 16.5 30 V17.4 Z"
+                      fill="#fff" fill-opacity="0.14"/>
+                <path d="M26 26 L38 38 M38 26 L26 38"
+                      stroke="#fff" stroke-width="4.2" stroke-linecap="round"/>
+            </svg>
+        </div>
+
+        <h1>Access denied</h1>
+        <div class="error-code">HTTP 403 · Forbidden</div>
+
+        <p>Authentication is required to access this application. A valid access hash is needed to proceed.</p>
+
+        <div class="auth-info">
+            <strong>How to access</strong>
+            Append the access hash as a query parameter to the URL:
+            <div class="code-example">https://your-app-url/?hash=YOUR_ACCESS_HASH</div>
+        </div>
+
+        <div class="help-section">
+            <h3>Need help?</h3>
+            <ul>
+                <li>Open the app through its dashboard launch button.</li>
+                <li>Ask your administrator for the access hash.</li>
+                <li>Confirm the URL includes the correct <code>?hash=</code> parameter.</li>
+                <li>Check that the hash hasn't been rotated since you last used it.</li>
+                <li>If you are signed in with an account that lacks access, <a href="/nhl-auth/logout">sign out</a> and sign in again.</li>
+            </ul>
+        </div>
+
+        <div class="footer">
+            <span class="mark">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 1.5 20 4.5 V11 C20 16.6 16.4 20.7 12 22.5 C7.6 20.7 4 16.6 4 11 V4.5 Z"/></svg>
+                AppShield
+            </span>
+        </div>
+    </div>
+</body>
+</html>

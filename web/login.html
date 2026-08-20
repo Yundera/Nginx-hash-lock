@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in · AppShield</title>
+    <style>
+        :root {
+            --bg-1: #0f172a;
+            --bg-2: #1e293b;
+            --accent: #4f46e5;
+            --accent-2: #2563eb;
+            --ink: #0f172a;
+            --muted: #64748b;
+            --line: #e2e8f0;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: radial-gradient(1200px 600px at 50% -10%, #243049 0%, var(--bg-1) 60%), var(--bg-2);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--ink);
+            padding: 1.5rem;
+        }
+
+        .container {
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 20px 50px rgba(2, 6, 23, 0.45);
+            padding: 2.75rem;
+            text-align: center;
+            max-width: 420px;
+            width: 100%;
+        }
+
+        .shield {
+            width: 72px;
+            height: 72px;
+            margin: 0 auto 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .shield svg { width: 100%; height: 100%; }
+
+        h1 {
+            color: var(--ink);
+            margin-bottom: 0.4rem;
+            font-size: 1.6rem;
+            font-weight: 700;
+            letter-spacing: -0.01em;
+        }
+
+        .subtitle {
+            color: var(--muted);
+            margin-bottom: 2rem;
+            font-size: 0.95rem;
+        }
+
+        .login-form { text-align: left; }
+
+        .form-group { margin-bottom: 1.25rem; }
+
+        label {
+            display: block;
+            margin-bottom: 0.45rem;
+            color: #334155;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            border: 1.5px solid var(--line);
+            border-radius: 10px;
+            font-size: 1rem;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        input[type="text"]:focus,
+        input[type="password"]:focus {
+            outline: none;
+            border-color: var(--accent-2);
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+        }
+
+        .login-button {
+            width: 100%;
+            padding: 0.85rem;
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-2) 100%);
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.2s, opacity 0.2s;
+            margin-top: 0.25rem;
+        }
+
+        .login-button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 8px 20px rgba(79, 70, 229, 0.35);
+        }
+
+        .login-button:active { transform: translateY(0); }
+
+        .error-message {
+            background: #fef2f2;
+            border-left: 3px solid #ef4444;
+            padding: 0.85rem 1rem;
+            margin-bottom: 1.5rem;
+            border-radius: 0 8px 8px 0;
+            color: #b91c1c;
+            font-size: 0.875rem;
+            text-align: left;
+            display: none;
+        }
+        .error-message.show { display: block; }
+        .error-message strong { display: block; margin-bottom: 0.2rem; }
+
+        .footer {
+            margin-top: 2rem;
+            padding-top: 1.25rem;
+            border-top: 1px solid #eef2f7;
+            color: #94a3b8;
+            font-size: 0.78rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.4rem;
+        }
+        .footer .mark {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-weight: 600;
+            color: #64748b;
+        }
+        .footer .mark svg { width: 14px; height: 14px; }
+
+        @media (max-width: 480px) {
+            .container { padding: 2rem 1.5rem; }
+            h1 { font-size: 1.4rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="shield">
+            <!-- AppShield mark -->
+            <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <defs>
+                    <linearGradient id="as-grad" x1="12" y1="6" x2="52" y2="58" gradientUnits="userSpaceOnUse">
+                        <stop offset="0" stop-color="#6366f1"/>
+                        <stop offset="1" stop-color="#2563eb"/>
+                    </linearGradient>
+                </defs>
+                <path d="M32 4 L54 13 V30 C54 45 44.5 54.5 32 60 C19.5 54.5 10 45 10 30 V13 Z"
+                      fill="url(#as-grad)"/>
+                <path d="M32 11 L47.5 17.4 V30 C47.5 41 40.8 48.4 32 52.6 C23.2 48.4 16.5 41 16.5 30 V17.4 Z"
+                      fill="#fff" fill-opacity="0.14"/>
+                <path d="M24 32.5 L29.5 38 L41 26"
+                      stroke="#fff" stroke-width="4.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+        </div>
+
+        <h1>Authentication required</h1>
+        <div class="subtitle">Sign in to continue to this application.</div>
+
+        <div class="error-message" id="errorMessage">
+            <strong>Authentication failed</strong>
+            Invalid username or password. Please try again.
+        </div>
+
+        <form method="POST" action="/nhl-auth/login" class="login-form">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required autofocus autocomplete="username">
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required autocomplete="current-password">
+            </div>
+
+            <input type="hidden" name="redirect" id="redirect" value="/">
+
+            <button type="submit" class="login-button">Sign in</button>
+        </form>
+
+        <div class="footer">
+            <span class="mark">
+                <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 1.5 20 4.5 V11 C20 16.6 16.4 20.7 12 22.5 C7.6 20.7 4 16.6 4 11 V4.5 Z"/></svg>
+                AppShield
+            </span>
+        </div>
+    </div>
+
+    <script>
+        // Check for error parameter in URL
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('error') === 'invalid') {
+            document.getElementById('errorMessage').classList.add('show');
+        }
+
+        // Preserve redirect parameter from URL
+        const redirectParam = urlParams.get('redirect');
+        if (redirectParam) {
+            document.getElementById('redirect').value = decodeURIComponent(redirectParam);
+        }
+    </script>
+</body>
+</html>

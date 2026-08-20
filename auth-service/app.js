@@ -1326,14 +1326,37 @@ app.post(BACKCHANNEL_LOGOUT_PATH, express.urlencoded({ extended: false }), async
         }
 
         // Prefer `sid`: it names ONE session at the OP, so a user signed in on a
-        // phone and a laptop only loses the one they signed out of. `sub` is the
-        // fallback for an OP that issues no sid, and deliberately ends all of
-        // that subject's sessions here — the spec's own semantics.
+        // phone and a laptop only loses the one they signed out of.
+        //
+        // FALL BACK TO `sub` WHEN THE STORED SESSION HAS NO sid. This is not
+        // sloppiness, it is the upgrade path, and without it the feature has a
+        // permanent hole. A session minted before this gate started recording
+        // `sid` — i.e. every session in existence at upgrade time — can never
+        // match a sid-bearing logout token, so it would survive every logout for
+        // its full 30 days while looking, to the user, exactly like logout is
+        // broken. Measured on wisera 2026-08-19: the maison gate held 14 such
+        // sessions, all `sid=NONE, idToken=NO, method=oidc`, and opening the app
+        // after a full successful logout still walked straight in.
+        //
+        // The fallback is deliberately narrow and self-limiting: it applies only
+        // to sessions that carry no sid at all, and it disappears on its own once
+        // the last pre-upgrade session has expired or been replaced. Sessions that
+        // DO carry a sid keep exact per-device semantics.
+        //
+        // Ending a legacy session by subject is broader than the token asked for
+        // (it can take that user's other devices too). That is the right side to
+        // err on: the alternative is a session the OP believes it has revoked and
+        // this gate still honours.
         let ended = 0;
+        let legacyEnded = 0;
         for (const [id, sess] of Object.entries(sessions)) {
-            const match = payload.sid
-                ? sess.oidcSid === payload.sid
-                : sess.oidcSub === payload.sub;
+            let match = false;
+            if (payload.sid && sess.oidcSid) {
+                match = sess.oidcSid === payload.sid;
+            } else if (payload.sub && sess.oidcSub) {
+                match = sess.oidcSub === payload.sub;
+                if (match && !sess.oidcSid) legacyEnded++;
+            }
             if (match) {
                 delete sessions[id];
                 ended++;
@@ -1342,7 +1365,10 @@ app.post(BACKCHANNEL_LOGOUT_PATH, express.urlencoded({ extended: false }), async
         if (ended > 0) {
             saveSessionsSoon();
         }
-        console.log(`[Auth Service] Back-channel logout: ended ${ended} session(s) (${payload.sid ? 'sid' : 'sub'})`);
+        console.log(
+            `[Auth Service] Back-channel logout: ended ${ended} session(s) ` +
+            `(${payload.sid ? 'sid' : 'sub'}` +
+            (legacyEnded ? `, ${legacyEnded} pre-sid legacy` : '') + ')');
 
         // 200 with no-store, per spec. Reporting how many sessions matched would
         // leak whether this user is signed in here to anyone who can reach the
