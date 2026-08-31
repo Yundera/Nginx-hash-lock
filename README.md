@@ -625,7 +625,11 @@ environment:
 ### Security Model
 
 - **Main site** (`/`, `/settings`, etc.) → Requires login or `?hash=AUTH_HASH`
-- **Content paths** (`/[40-hex-chars]/*`) → Accessible if you know the content hash
+- **Content paths** (`/[40-hex-chars]` or `/[40-hex-chars]/...`) → Accessible if you know the
+  content hash. The hash must be a **whole path segment**: `/<40hex>deadbeef` is not a hash and
+  stays gated. The exemption is granted on the *shape* of the path, not on whether the hash
+  names content that exists — anyone who can invent a well-formed hash reaches the backend
+  unauthenticated, so enable this only for backends where that is acceptable.
 
 This is similar to how signed URLs work on cloud storage services - the hash IS the authentication for that specific content.
 

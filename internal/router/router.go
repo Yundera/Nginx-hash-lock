@@ -140,9 +140,17 @@ func (rt *Router) matchesBypass(path string) bool {
 	return false
 }
 
-// isHashContentPath matches nginx's ^/[a-f0-9]{40} — deliberately unanchored
-// at the end, so anything under a 40-hex prefix matches. Used by Stremio-style
-// apps where the hash in the path is itself the capability token.
+// isHashContentPath matches a 40-hex-character *first path segment*: "/<hash>"
+// or "/<hash>/...". Used by Stremio-style apps where the hash in the path is
+// itself the capability token, because external players and casting devices
+// cannot carry the SSO session cookie.
+//
+// The trailing segment boundary is required. Without it a 40-hex prefix of a
+// longer token also matched — "/<40hex>deadbeef" bypassed the gate — which is
+// wider than the "/[40-hex-chars]/*" the README documents. Note this still
+// exempts any well-formed hash whether or not it names real content: the
+// capability is the shape, not a validated reference. Narrowing that further
+// means checking the hash against live content, which is a backend question.
 func isHashContentPath(path string) bool {
 	if len(path) < 41 || path[0] != '/' {
 		return false
@@ -153,7 +161,8 @@ func isHashContentPath(path string) bool {
 			return false
 		}
 	}
-	return true
+	// Either the path ends at the hash, or the next byte opens a new segment.
+	return len(path) == 41 || path[41] == '/'
 }
 
 func underPrefix(path, prefix string) bool {
