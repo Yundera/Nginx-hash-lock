@@ -146,10 +146,10 @@ func TestHashContentPaths(t *testing.T) {
 
 	// The legitimate stream and download shapes must keep working.
 	for _, p := range []string{
-		hash40,                 // bare hash
-		hash40 + "/",           // trailing slash
-		hash40 + "/0",          // stock stream route: hash + numeric file index
-		hash40 + "/movie.mkv",  // download-by-filename
+		hash40,                // bare hash
+		hash40 + "/",          // trailing slash
+		hash40 + "/0",         // stock stream route: hash + numeric file index
+		hash40 + "/movie.mkv", // download-by-filename
 		hash40 + "/0/stream-q-720.m3u8",
 	} {
 		if got := rt.Match(p); got != KindBypass {
